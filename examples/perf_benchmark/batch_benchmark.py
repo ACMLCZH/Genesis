@@ -1,4 +1,3 @@
-from benchmark import BenchmarkArgs
 from benchmark_plotter import plot_batch_benchmark
 import argparse
 import subprocess
@@ -6,17 +5,47 @@ import os
 from datetime import datetime
 import pandas as pd
 
+class BenchmarkArgs:
+    def __init__(self,
+        rasterizer, n_envs, n_steps, resX, resY,
+        camera_posX, camera_posY, camera_posZ,
+        camera_lookatX, camera_lookatY, camera_lookatZ,
+        camera_fov, mjcf, benchmark_result_file_path,
+        max_bounce=1, 
+    ):
+        self.rasterizer = rasterizer
+        self.n_envs = n_envs
+        self.n_steps = n_steps
+        self.resX = resX
+        self.resY = resY
+        self.camera_posX = camera_posX
+        self.camera_posY = camera_posY
+        self.camera_posZ = camera_posZ
+        self.camera_lookatX = camera_lookatX
+        self.camera_lookatY = camera_lookatY
+        self.camera_lookatZ = camera_lookatZ
+        self.camera_fov = camera_fov
+        self.mjcf = mjcf
+        self.benchmark_result_file_path = benchmark_result_file_path
+        self.max_bounce = max_bounce
+
 class BatchBenchmarkArgs:
-    def __init__(self, use_full_list, continue_from):
+    def __init__(self, use_full_list, continue_from, script):
         self.use_full_list = use_full_list
         self.continue_from = continue_from
+        self.script = script
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-f", "--use_full_list", action="store_true", default=False)
     parser.add_argument("-c", "--continue_from", type=str, default=None)
+    parser.add_argument("-s", "--script", type=str, default="benchmark.py")
     args = parser.parse_args()
-    return BatchBenchmarkArgs(use_full_list=args.use_full_list, continue_from=args.continue_from)
+    return BatchBenchmarkArgs(
+        use_full_list=args.use_full_list,
+        continue_from=args.continue_from,
+        script=args.script
+    )
 
 def create_batch_args(benchmark_result_file_path, use_full_list=False):
     # Ensure the directory exists
@@ -177,22 +206,23 @@ def run_batch_benchmark(batch_args_dict, benchmark_script_path, previous_runs=No
                     # launch a process to run the benchmark
                     cmd = ["python3", benchmark_script_path]
                     if batch_args.rasterizer:
-                        cmd.append("-r")
+                        cmd.append("--rasterizer")
                     cmd.extend([
-                        "-n", str(batch_args.n_envs),
-                        "-s", str(batch_args.n_steps),
-                        "-x", str(batch_args.resX), 
-                        "-y", str(batch_args.resY),
-                        "-i", str(batch_args.camera_posX),
-                        "-j", str(batch_args.camera_posY),
-                        "-k", str(batch_args.camera_posZ), 
-                        "-l", str(batch_args.camera_lookatX),
-                        "-m", str(batch_args.camera_lookatY),
-                        "-o", str(batch_args.camera_lookatZ),
-                        "-v", str(batch_args.camera_fov),
-                        "-f", batch_args.mjcf,
-                        "-g", batch_args.benchmark_result_file_path
+                        "--n_envs", str(batch_args.n_envs),
+                        "--n_steps", str(batch_args.n_steps),
+                        "--resX", str(batch_args.resX), 
+                        "--resY", str(batch_args.resY),
+                        "--camera_posX", str(batch_args.camera_posX),
+                        "--camera_posY", str(batch_args.camera_posY),
+                        "--camera_posZ", str(batch_args.camera_posZ), 
+                        "--camera_lookatX", str(batch_args.camera_lookatX),
+                        "--camera_lookatY", str(batch_args.camera_lookatY),
+                        "--camera_lookatZ", str(batch_args.camera_lookatZ),
+                        "--camera_fov", str(batch_args.camera_fov),
+                        "--mjcf", batch_args.mjcf,
+                        "--benchmark_result_file_path", batch_args.benchmark_result_file_path
                     ])
+                    print(" ".join(cmd))
                     try:
                         process = subprocess.Popen(cmd)
                         return_code = process.wait()
@@ -215,7 +245,7 @@ def main():
 
     # Run benchmark in batch
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    benchmark_script_path = f"{current_dir}/benchmark.py"
+    benchmark_script_path = f"{current_dir}/{batch_benchmark_args.script}"
     if not os.path.exists(benchmark_script_path):
         raise FileNotFoundError(f"Benchmark script not found: {benchmark_script_path}")
         
