@@ -103,6 +103,7 @@ from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.asset.importer.mjcf")
 import isaacsim.asset.importer.mjcf
 
+shadow = False
 
 def load_mjcf(mjcf_path):
     return MjcfConverter(
@@ -143,9 +144,11 @@ def init_isaac(benchmark_args):
     print("Clamp spp:", carb_settings.get("/rtx/pathtracing/clampSpp"))
     print("Max bounce:", carb_settings.get("/rtx/pathtracing/maxBounces"))
     print("Optix Denoiser", carb_settings.get("/rtx/pathtracing/optixDenoiser/enabled"))
+    print("Shadows", carb_settings.get("/rtx/shadows/enabled"))
 
     rep.settings.set_render_rtx_realtime()
     if benchmark_args.rasterizer:
+        # carb_settings.set("/rtx/rendermode", "Hydra Storm")
         carb_settings.set("/rtx/rendermode", "RayTracedLighting")
     else:
         carb_settings.set("/rtx/rendermode", "PathTracing")
@@ -154,6 +157,7 @@ def init_isaac(benchmark_args):
     carb_settings.set("/rtx/pathtracing/clampSpp", benchmark_args.spp)
     carb_settings.set("/rtx/pathtracing/maxBounces", benchmark_args.max_bounce)
     carb_settings.set("/rtx/pathtracing/optixDenoiser/enabled", False)
+    carb_settings.set("/rtx/shadows/enabled", shadow)
 
     print("After setting:")
     print("Render mode:", carb_settings.get("/rtx/rendermode"))
@@ -162,6 +166,7 @@ def init_isaac(benchmark_args):
     print("Clamp spp:", carb_settings.get("/rtx/pathtracing/clampSpp"))
     print("Max bounce:", carb_settings.get("/rtx/pathtracing/maxBounces"))
     print("Optix Denoiser", carb_settings.get("/rtx/pathtracing/optixDenoiser/enabled"))
+    print("Shadows", carb_settings.get("/rtx/shadows/enabled"))
 
     ########################## entities ##########################
     spacing_row = np.array((1.0, -3.0))
@@ -362,7 +367,8 @@ def run_benchmark(scene, camera, benchmark_args):
             # print(rgb_tiles.dtype, depth_tiles.dtype)
             for j in range(n_envs):
                 rgb_image = Image.fromarray(rgb_tiles[j])
-                rgb_path = os.path.join(image_dir, f"image_rgb_{i}_{j}_bounce{benchmark_args.max_bounce}_spp{benchmark_args.spp}.png")
+                rgb_name = f"image_rgb_{i}_{j}_bounce{benchmark_args.max_bounce}_spp{benchmark_args.spp}_shadow{shadow}.png"
+                rgb_path = os.path.join(image_dir, rgb_name)
                 rgb_image.save(rgb_path)
                 print("Image saved:", rgb_path)
 
