@@ -11,7 +11,7 @@ class BenchmarkArgs:
         camera_posX, camera_posY, camera_posZ,
         camera_lookatX, camera_lookatY, camera_lookatZ,
         camera_fov, mjcf, benchmark_result_file_path,
-        max_bounce=1, 
+        max_bounce=1, spp=1,
     ):
         self.rasterizer = rasterizer
         self.n_envs = n_envs
@@ -28,6 +28,7 @@ class BenchmarkArgs:
         self.mjcf = mjcf
         self.benchmark_result_file_path = benchmark_result_file_path
         self.max_bounce = max_bounce
+        self.spp = spp
 
 class BatchBenchmarkArgs:
     def __init__(self, use_full_list, continue_from, script):

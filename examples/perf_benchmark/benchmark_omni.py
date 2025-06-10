@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("-f", "--mjcf", type=str, default="xml/franka_emika_panda/panda.xml")
     parser.add_argument("-g", "--benchmark_result_file_path", type=str, default="benchmark.csv")
     parser.add_argument("--max_bounce", type=int, default=4)
+    parser.add_argument("--spp", type=int, default=64)
     
     args = parser.parse_args()
     benchmark_args = BenchmarkArgs(
@@ -42,6 +43,7 @@ def parse_args():
         mjcf=args.mjcf,
         benchmark_result_file_path=args.benchmark_result_file_path,
         max_bounce=args.max_bounce,
+        spp=args.spp,
     )
     print(f"Benchmark with args:")
     print(f"  rasterizer: {benchmark_args.rasterizer}")
@@ -53,6 +55,8 @@ def parse_args():
     print(f"  camera_fov: {benchmark_args.camera_fov}")
     print(f"  mjcf: {benchmark_args.mjcf}")
     print(f"  benchmark_result_file_path: {benchmark_args.benchmark_result_file_path}")
+    print(f"  max_bounce: {benchmark_args.max_bounce}")
+    print(f"  spp: {benchmark_args.spp}")
     return benchmark_args
 
 benchmark_args = parse_args()
@@ -138,16 +142,18 @@ def init_isaac(benchmark_args):
     print("Total spp:", carb_settings.get("/rtx/pathtracing/totalSpp"))
     print("Clamp spp:", carb_settings.get("/rtx/pathtracing/clampSpp"))
     print("Max bounce:", carb_settings.get("/rtx/pathtracing/maxBounces"))
+    print("Optix Denoiser", carb_settings.get("/rtx/pathtracing/optixDenoiser/enabled"))
 
     rep.settings.set_render_rtx_realtime()
     if benchmark_args.rasterizer:
         carb_settings.set("/rtx/rendermode", "RayTracedLighting")
     else:
         carb_settings.set("/rtx/rendermode", "PathTracing")
-    # carb_settings.set("/rtx/pathtracing/spp", 1)
-    # carb_settings.set("/rtx/pathtracing/totalSpp", 1)
-    # carb_settings.set("/rtx/pathtracing/clampSpp", 1)
+    carb_settings.set("/rtx/pathtracing/spp", benchmark_args.spp)
+    carb_settings.set("/rtx/pathtracing/totalSpp", benchmark_args.spp)
+    carb_settings.set("/rtx/pathtracing/clampSpp", benchmark_args.spp)
     carb_settings.set("/rtx/pathtracing/maxBounces", benchmark_args.max_bounce)
+    carb_settings.set("/rtx/pathtracing/optixDenoiser/enabled", False)
 
     print("After setting:")
     print("Render mode:", carb_settings.get("/rtx/rendermode"))
@@ -155,6 +161,7 @@ def init_isaac(benchmark_args):
     print("Total spp:", carb_settings.get("/rtx/pathtracing/totalSpp"))
     print("Clamp spp:", carb_settings.get("/rtx/pathtracing/clampSpp"))
     print("Max bounce:", carb_settings.get("/rtx/pathtracing/maxBounces"))
+    print("Optix Denoiser", carb_settings.get("/rtx/pathtracing/optixDenoiser/enabled"))
 
     ########################## entities ##########################
     spacing_row = np.array((1.0, -3.0))
@@ -355,7 +362,7 @@ def run_benchmark(scene, camera, benchmark_args):
             # print(rgb_tiles.dtype, depth_tiles.dtype)
             for j in range(n_envs):
                 rgb_image = Image.fromarray(rgb_tiles[j])
-                rgb_path = os.path.join(image_dir, f"image_rgb_{i}_{j}_bounce{benchmark_args.max_bounce}.png")
+                rgb_path = os.path.join(image_dir, f"image_rgb_{i}_{j}_bounce{benchmark_args.max_bounce}_spp{benchmark_args.spp}.png")
                 rgb_image.save(rgb_path)
                 print("Image saved:", rgb_path)
 
