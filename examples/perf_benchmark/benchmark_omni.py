@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument("-g", "--benchmark_result_file_path", type=str, default="benchmark.csv")
     parser.add_argument("--max_bounce", type=int, default=4)
     parser.add_argument("--spp", type=int, default=64)
+    parser.add_argument("--gui", action="store_true", default=False)
     
     args = parser.parse_args()
     benchmark_args = BenchmarkArgs(
@@ -44,6 +45,7 @@ def parse_args():
         benchmark_result_file_path=args.benchmark_result_file_path,
         max_bounce=args.max_bounce,
         spp=args.spp,
+        gui=args.gui,
     )
     print(f"Benchmark with args:")
     print(f"  rasterizer: {benchmark_args.rasterizer}")
@@ -64,8 +66,7 @@ benchmark_args = parse_args()
 # Launch app
 from isaaclab.app import AppLauncher
 app = AppLauncher(
-    # headless=False,
-    headless=True,
+    headless=not benchmark_args.gui,
     enable_cameras=True,
     device="cuda:0",
     rendering_mode="performance",
@@ -98,7 +99,7 @@ from isaaclab.utils.math import (
     quat_from_matrix,
 )
 import omni.replicator.core as rep
-from pxr import UsdLux, Gf
+from pxr import UsdLux, Gf, PhysxSchema
 
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.asset.importer.mjcf")
@@ -146,6 +147,12 @@ def init_isaac(benchmark_args):
     cam_eye = torch.Tensor(cam_eye).reshape(-1, 3)
     cam_target = torch.Tensor(cam_target).reshape(-1, 3)
     carb_settings = carb.settings.get_settings()
+
+    physxSceneAPI = PhysxSchema.PhysxSceneAPI.Apply(stage.GetPrimAtPath("/physicsScene"))
+    physxSceneAPI.CreateGpuTempBufferCapacityAttr(16 * 1024 * 1024 * 2)
+    physxSceneAPI.CreateGpuHeapCapacityAttr(64 * 1024 * 1024 * 2)
+    physxSceneAPI.CreateGpuMaxRigidPatchCountAttr(8388608)
+    physxSceneAPI.CreateGpuMaxRigidContactCountAttr(16777216)
 
     # Options: https://docs.omniverse.nvidia.com/materials-and-rendering/latest/rtx-renderer_pt.html
     print("Before setting:")
@@ -363,6 +370,10 @@ def run_benchmark(scene, camera, benchmark_args):
             camera.update(dt)
             _ = camera.data
         print("Env and steps:", n_envs, n_steps)
+        
+        if benchmark_args.gui:
+            while True:
+               scene.step()
 
         # fill gpu cache with random data
         fill_gpu_cache_with_random_data()
@@ -380,19 +391,19 @@ def run_benchmark(scene, camera, benchmark_args):
             # print(rgb_tiles.shape, depth_tiles.shape)
             # print(rgb_tiles.dtype, depth_tiles.dtype)
 
-            for j in range(n_envs):
-                rgb_image = Image.fromarray(rgb_tiles[j])
-                rgb_name = f"image_rgb_{i}_{j}_bounce{benchmark_args.max_bounce}_spp{benchmark_args.spp}_shadow{shadow}.png"
-                rgb_path = os.path.join(image_dir, rgb_name)
-                rgb_image.save(rgb_path)
-                print("Image saved:", rgb_path)
+            # for j in range(n_envs):
+            #     rgb_image = Image.fromarray(rgb_tiles[j])
+            #     rgb_name = f"image_rgb_{i}_{j}_bounce{benchmark_args.max_bounce}_spp{benchmark_args.spp}_shadow{shadow}.png"
+            #     rgb_path = os.path.join(image_dir, rgb_name)
+            #     rgb_image.save(rgb_path)
+            #     print("Image saved:", rgb_path)
 
-                depth_tile = depth_tiles[j][:, :, 0]
-                depth_tile = ((1.0 - (depth_tile / np.max(depth_tile))) * 255.0).astype(np.uint8)
-                depth_image = Image.fromarray(depth_tile, mode="L")
-                depth_path = os.path.join(image_dir, f"image_depth_{i}_{j}.png")
-                depth_image.save(depth_path)
-                print("Image saved:", depth_path)
+            #     depth_tile = depth_tiles[j][:, :, 0]
+            #     depth_tile = ((1.0 - (depth_tile / np.max(depth_tile))) * 255.0).astype(np.uint8)
+            #     depth_image = Image.fromarray(depth_tile, mode="L")
+            #     depth_path = os.path.join(image_dir, f"image_depth_{i}_{j}.png")
+            #     depth_image.save(depth_path)
+            #     print("Image saved:", depth_path)
 
         end_time = time()
         time_taken = end_time - start_time

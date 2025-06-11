@@ -174,8 +174,16 @@ def run_batch_benchmark(batch_args_dict, benchmark_script_path, previous_runs=No
                         
                     # Run the benchmark
                     batch_args = batch_args_dict[rasterizer][mjcf][batch_size][resolution]
-                    if batch_args.resX == 256 and batch_args.n_envs >= 1024:
-                        continue
+                    if batch_args.mjcf in ["xml/unitree_g1/g1.xml", "xml/unitree_go2/go2.xml"]:
+                        if batch_args.resX == 256:
+                            if batch_args.n_envs >= 512:
+                                continue
+                        elif batch_args.resX == 128:
+                            if batch_args.n_envs >= 1024:
+                                continue
+                    else:
+                        if batch_args.resX == 256 and batch_args.n_envs >= 1024:
+                            continue
                     
                     # launch a process to run the benchmark
                     cmd = ["python3", benchmark_script_path]
