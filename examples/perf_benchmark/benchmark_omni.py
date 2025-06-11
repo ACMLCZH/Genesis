@@ -90,7 +90,8 @@ from isaaclab.assets import (
 )
 from isaaclab.sensors.camera import TiledCamera, TiledCameraCfg
 from isaaclab.sim.converters import (
-    MjcfConverter, MjcfConverterCfg
+    MjcfConverter, MjcfConverterCfg,
+    UrdfConverter, UrdfConverterCfg
 )
 from isaaclab.utils.math import (
     create_rotation_matrix_from_view,
@@ -109,6 +110,16 @@ def load_mjcf(mjcf_path):
     return MjcfConverter(
         MjcfConverterCfg(
             asset_path=mjcf_path,
+            fix_base=True,
+            force_usd_conversion=True
+        )
+    ).usd_path
+
+def load_urdf(urdf_path):
+    return UrdfConverter(
+        UrdfConverterCfg(
+            asset_path=urdf_path,
+            joint_drive=None,
             fix_base=True,
             force_usd_conversion=True
         )
@@ -169,8 +180,8 @@ def init_isaac(benchmark_args):
     print("Shadows", carb_settings.get("/rtx/shadows/enabled"))
 
     ########################## entities ##########################
-    spacing_row = np.array((1.0, -3.0))
-    spacing_col = np.array((-3.0, -1.0))
+    spacing_row = np.array((2.0, -6.0))
+    spacing_col = np.array((-6.0, -2.0))
     n_cols = int(math.sqrt(benchmark_args.n_envs))
     offsets = []
     for i in range(benchmark_args.n_envs):
@@ -184,22 +195,26 @@ def init_isaac(benchmark_args):
         )
     offsets = np.array(offsets)
 
-    franka_path = load_mjcf(os.path.join("genesis/assets", benchmark_args.mjcf))
-    print(franka_path)
-    print(stage.GetPrimAtPath("/World/Origin"))
-    franka = Articulation(
-        cfg=ArticulationCfg(
-    # franka = RigidObject(
-    #     cfg=RigidObjectCfg(
-            prim_path="/World/Origin.*/franka",
-            spawn=sim_utils.UsdFileCfg(usd_path=franka_path,),
-            actuators={},
-        )
-    )
-    for i in range(benchmark_args.n_envs):
-        stage.RemovePrim(f"/World/Origin{i:05d}/franka/worldBody")
-    print(stage.GetPrimAtPath("World/Origin00000/franka/worldBody"))
-    print(stage.GetPrimAtPath("World/Origin00001/franka/worldBody"))
+    # load objects
+    # plane_path = load_urdf(os.path.join("genesis/assets", "urdf/plane/plane.urdf"))
+    plane_path = os.path.abspath(os.path.join("genesis/assets", "urdf/plane_usd/plane.usd"))
+    print(plane_path)
+    plane_cfg = sim_utils.UsdFileCfg(usd_path=plane_path)
+    plane_cfg.func("/World/Origin.*/plane", plane_cfg)
+
+    robot_name = f"{os.path.splitext(benchmark_args.mjcf)[0]}_new.xml"
+    robot_path = load_mjcf(os.path.join("genesis/assets", robot_name))
+    print("Robot asset:", robot_path)
+    robot_cfg = sim_utils.UsdFileCfg(usd_path=robot_path)
+    robot_cfg.func("/World/Origin.*/robot", robot_cfg)
+    # robot = Articulation(
+    #     cfg = ArticulationCfg(
+    #         prim_path="/World/Origin.*/robot",
+    #         actuators={},))
+    # for i in range(benchmark_args.n_envs):
+    #     stage.RemovePrim(f"/World/Origin{i:05d}/robot/worldBody")
+    # print(stage.GetPrimAtPath("World/Origin00000/robot/worldBody"))
+    # print(stage.GetPrimAtPath("World/Origin00001/robot/worldBody"))
 
     cam_fov = math.radians(benchmark_args.camera_fov)
     cam_hapert = 20.955
@@ -342,12 +357,11 @@ def run_benchmark(scene, camera, benchmark_args):
         )
 
         scene.reset()
-        # while True:
-        #     scene.step()
         dt = scene.get_physics_dt()
-        scene.step()
-        camera.update(dt)
-        _ = camera.data
+        for i in range(3):
+            scene.step()
+            camera.update(dt)
+            _ = camera.data
         print("Env and steps:", n_envs, n_steps)
 
         # fill gpu cache with random data
@@ -365,6 +379,7 @@ def run_benchmark(scene, camera, benchmark_args):
             depth_tiles = camera.data.output.get("depth").detach().cpu().numpy()
             # print(rgb_tiles.shape, depth_tiles.shape)
             # print(rgb_tiles.dtype, depth_tiles.dtype)
+
             for j in range(n_envs):
                 rgb_image = Image.fromarray(rgb_tiles[j])
                 rgb_name = f"image_rgb_{i}_{j}_bounce{benchmark_args.max_bounce}_spp{benchmark_args.spp}_shadow{shadow}.png"
@@ -378,7 +393,7 @@ def run_benchmark(scene, camera, benchmark_args):
                 depth_path = os.path.join(image_dir, f"image_depth_{i}_{j}.png")
                 depth_image.save(depth_path)
                 print("Image saved:", depth_path)
-        
+
         end_time = time()
         time_taken = end_time - start_time
         time_taken_per_env = time_taken / n_envs
@@ -395,7 +410,6 @@ def run_benchmark(scene, camera, benchmark_args):
             f"GPU Compute:{system_utilization_analytics[2]}% | "
             f" GPU Memory: {system_utilization_analytics[3]:.2f}% |"
         )
-
 
         # Append a line with all args and results in csv format
         with open(benchmark_args.benchmark_result_file_path, 'a') as f:
