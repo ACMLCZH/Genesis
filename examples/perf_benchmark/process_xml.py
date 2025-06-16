@@ -2,6 +2,8 @@ import xml.etree.ElementTree as ET
 import argparse
 import os
 import copy
+import uuid
+
 
 def wrap_visual_geoms_with_bodies(input_file, output_file):
     tree = ET.parse(input_file)
@@ -17,7 +19,7 @@ def wrap_visual_geoms_with_bodies(input_file, output_file):
                     body = ET.Element("body")
                     # Give it a name based on mesh if available
                     mesh_name = elem.attrib.get("mesh", f"{i}")
-                    body.set("name", f"body_{mesh_name}")
+                    body.set("name", f"body_{mesh_name}_{str(uuid.uuid4())[:4]}")
                     # Deep copy of the geom to keep attributes
                     body.append(copy.deepcopy(elem))
                     # Replace <geom> with <body> in parent
