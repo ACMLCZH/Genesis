@@ -10,6 +10,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.repr_base import RBC
 
+
 class Camera(RBC):
     """
     Genesis camera class. The camera can be used to render RGB, depth, and segmentation images. The camera can use either rasterizer or raytracer for rendering, specified by `scene.renderer`.
@@ -185,16 +186,17 @@ class Camera(RBC):
         assert self._visualizer._use_batch_renderer, "Batch renderer is not enabled."
 
         rgb_arr, depth_arr, seg_arr, normal_arr = self._batch_renderer.render(rgb, depth)
-        # The first dimension of the output is env. The second dimension of the array is camera.
+        # If n_envs > 0, the first dimension of the output is env. The second dimension of the array is camera.
+        # If n_envs == 0, the first dimension of the output is camera.
         # Only return the current camera's image
         if rgb_arr is not None:
-            rgb_arr = rgb_arr[:, self._idx]
+            rgb_arr = rgb_arr[:, self._idx] if rgb_arr.ndim == 5 else rgb_arr[self._idx]
         if depth_arr is not None:
-            depth_arr = depth_arr[:, self._idx]
+            depth_arr = depth_arr[:, self._idx] if depth_arr.ndim == 5 else depth_arr[self._idx]
         if seg_arr is not None:
-            seg_arr = seg_arr[:, self._idx]
+            seg_arr = seg_arr[:, self._idx] if seg_arr.ndim == 5 else seg_arr[self._idx]
         if normal_arr is not None:
-            normal_arr = normal_arr[:, self._idx]
+            normal_arr = normal_arr[:, self._idx] if normal_arr.ndim == 5 else normal_arr[self._idx]
         return rgb_arr, depth_arr, seg_arr, normal_arr
 
     @gs.assert_built
@@ -231,13 +233,13 @@ class Camera(RBC):
         if (rgb or depth or segmentation or normal) is False:
             gs.raise_exception("Nothing to render.")
 
-        if self._visualizer._use_batch_renderer:
-            return self._batch_render(rgb, depth, segmentation, colorize_seg, normal)
-
         rgb_arr, depth_arr, seg_idxc_arr, seg_arr, normal_arr = None, None, None, None, None
 
         if self._followed_entity is not None:
             self.update_following()
+
+        if self._visualizer._use_batch_renderer:
+            return self._batch_render(rgb, depth, segmentation, colorize_seg, normal)
 
         if self._raytracer is not None:
             if rgb:
@@ -355,7 +357,7 @@ class Camera(RBC):
                 K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
                 return K
 
-            def backproject_depth_to_pointcloud(K: np.ndarray, depth: np.ndarray, pose, world):
+            def backproject_depth_to_pointcloud(K: np.ndarray, depth: np.ndarray, pose, world, znear, zfar):
                 """Convert depth image to pointcloud given camera intrinsics.
                 Args:
                     depth (np.ndarray): Depth image.
@@ -368,10 +370,12 @@ class Camera(RBC):
                 _cy = K[1, 2]
 
                 # Mask out invalid depth
-                mask = np.where(depth > -1.0)
-                depth = np.maximum(depth, -0.99)
-                mask1 = np.where(depth > -1.0)
-                x, y = mask1[1], mask1[0]
+                mask = np.where((depth > znear) & (depth < zfar * 0.99))
+                # zfar * 0.99 for filtering out precision error of float
+                height, width = depth.shape
+                y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+                x = x.flatten()
+                y = y.flatten()
 
                 # Normalize pixel coordinates
                 normalized_x = x.astype(np.float32) - _cx
@@ -403,7 +407,9 @@ class Camera(RBC):
             T_OPENGL_TO_OPENCV = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
             cam_pose = self._rasterizer._camera_nodes[self.uid].matrix @ T_OPENGL_TO_OPENCV
 
-            pc, mask = backproject_depth_to_pointcloud(intrinsic_K, depth_arr, cam_pose, world_frame)
+            pc, mask = backproject_depth_to_pointcloud(
+                intrinsic_K, depth_arr, cam_pose, world_frame, self.near, self.far
+            )
 
             return pc, mask
 
@@ -565,6 +571,7 @@ class Camera(RBC):
         camera_transform = self._multi_env_transform_tensor
         lookat_pos = self._multi_env_lookat_tensor
 
+        # TODO: Optimize with batch computation
         for env_idx in range(self.n_envs):
             if self._follow_smoothing is not None:
                 # Smooth camera movement with a low-pass filter

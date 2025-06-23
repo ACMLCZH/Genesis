@@ -131,8 +131,9 @@ class BatchRenderer(RBC):
         """
         if(not force_render and self._last_t == self._visualizer.scene.t):
             return self._rgb_torch, self._depth_torch, None, None
-        self._last_t = self._visualizer.scene.t # Update last_t to current time to avoid re-rendering if the scene is not updated
         
+        # Update last_t to current time to avoid re-rendering if the scene is not updated    
+        self._last_t = self._visualizer.scene.t
         self.update_scene()
 
         rigid = self._visualizer.scene.rigid_solver
@@ -144,6 +145,11 @@ class BatchRenderer(RBC):
             camera_pos,
             camera_quat,
         )
+
+        # Squeeze the first dimension of the output if n_envs == 0
+        if self._visualizer.scene.n_envs == 0:
+            self._rgb_torch = self._rgb_torch.squeeze(0)
+            self._depth_torch = self._depth_torch.squeeze(0)
         return self._rgb_torch, self._depth_torch, None, None
     
     def destroy(self):

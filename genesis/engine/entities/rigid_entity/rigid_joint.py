@@ -33,7 +33,6 @@ class RigidJoint(RBC):
         dofs_limit,
         dofs_invweight,
         dofs_stiffness,
-        dofs_sol_params,
         dofs_damping,
         dofs_armature,
         dofs_kp,
@@ -62,7 +61,6 @@ class RigidJoint(RBC):
         self._dofs_limit = dofs_limit
         self._dofs_invweight = dofs_invweight
         self._dofs_stiffness = dofs_stiffness
-        self._dofs_sol_params = dofs_sol_params
         self._dofs_damping = dofs_damping
         self._dofs_armature = dofs_armature
         self._dofs_kp = dofs_kp
@@ -86,7 +84,7 @@ class RigidJoint(RBC):
         """
         raise DeprecationError(
             "This method has been removed. Please consider operating at link-level to get the cartesian position in "
-            "word frame."
+            "word frame. Alternatively, 'get_anchor_pos' returns the anchor position of the joint in the world frame."
         )
 
     def get_quat(self):
@@ -95,7 +93,7 @@ class RigidJoint(RBC):
         """
         raise DeprecationError(
             "This method has been removed. Please consider operating at link-level to get the cartesian orientation in "
-            "word frame."
+            "word frame. Alternatively, 'get_anchor_axis' returns the anchor axis of the joint in the world frame."
         )
 
     @gs.assert_built
@@ -140,6 +138,24 @@ class RigidJoint(RBC):
             xaxis = self._solver.joints_state[self._idx, i_b].xaxis
             for i in ti.static(range(3)):
                 tensor[i_b, i] = xaxis[i]
+
+    def set_sol_params(self, sol_params):
+        """
+        Set the solver parameters of this joint.
+        """
+        if self.is_built:
+            self._solver.set_sol_params(sol_params[..., None, :], joints_idx=self._idx, envs_idx=None, unsafe=False)
+        else:
+            self._sol_params = sol_params
+
+    @property
+    def sol_params(self):
+        """
+        Retruns the solver parameters of the joint.
+        """
+        if self.is_built:
+            return self._solver.get_sol_params(joints_idx=self._idx, envs_idx=None, unsafe=True)[..., 0, :]
+        return self._sol_params
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
@@ -237,13 +253,6 @@ class RigidJoint(RBC):
         return self._quat
 
     @property
-    def sol_params(self):
-        """
-        Retruns the solver parameters of the joint.
-        """
-        return self._sol_params
-
-    @property
     def q_start(self):
         """
         Returns the starting index of the `q` variables of the joint in the rigid solver.
@@ -304,7 +313,7 @@ class RigidJoint(RBC):
         single one, or none, respectively.
         """
         gs.logger.warning(
-            "This property is deprecated and will be removed in future release. Please use 'dof_idx_local' instead."
+            "This property is deprecated and will be removed in future release. Please use 'dofs_idx_local' instead."
         )
         if self.n_dofs == 1:
             return self.dof_start - self._entity.dof_start
@@ -394,13 +403,6 @@ class RigidJoint(RBC):
         Returns the stiffness of the dofs of the joint.
         """
         return self._dofs_stiffness
-
-    @property
-    def dofs_sol_params(self):
-        """
-        Retruns the solver parameters of the dofs of the joint.
-        """
-        return self._dofs_sol_params
 
     @property
     def dofs_damping(self):

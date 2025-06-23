@@ -9,17 +9,24 @@ def main():
 
     ########################## create a scene ##########################
     scene = gs.Scene(
-        sim_options=gs.options.SimOptions(),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, gravity=(0, 0, 0)),
         viewer_options=gs.options.ViewerOptions(
             res=(1920, 1080),
             camera_pos=(8.5, 0.0, 4.5),
             camera_lookat=(3.0, 0.0, 0.5),
             camera_fov=50,
         ),
-        rigid_options=gs.options.RigidOptions(enable_collision=False, gravity=(0, 0, 0)),
-        renderer = gs.options.renderers.BatchRenderer(
-            use_rasterizer=True,
-            batch_render_res=(1920, 1080),
+        renderer=gs.renderers.RayTracer(  # type: ignore
+            env_surface=gs.surfaces.Emission(
+                emissive_texture=gs.textures.ImageTexture(
+                    image_path="textures/indoor_bright.png",
+                ),
+            ),
+            env_radius=15.0,
+            env_euler=(0, 0, 180),
+            lights=[
+                {"pos": (0.0, 0.0, 10.0), "radius": 3.0, "color": (15.0, 15.0, 15.0)},
+            ],
         ),
     )
 

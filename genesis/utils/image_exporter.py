@@ -11,17 +11,17 @@ class FrameImageExporter:
         cv2.imwrite(f'{export_dir}/rgb_env{i_env}_{camera_name}_{i_step:03d}.png', rgb)
 
     @staticmethod
-    def _export_frame_depth_cam(export_dir, i_env, i_cam, camera_name, i_step, depth_normalized):
-        depth_normalized = depth_normalized[i_env, i_cam].cpu().numpy()
-        cv2.imwrite(f'{export_dir}/depth_env{i_env}_{camera_name}_{i_step:03d}.png', depth_normalized)
+    def _export_frame_depth_cam(export_dir, i_env, i_cam, camera_name, i_step, depth):
+        depth = depth[i_env, i_cam].cpu().numpy()
+        cv2.imwrite(f'{export_dir}/depth_env{i_env}_{camera_name}_{i_step:03d}.png', depth)
 
     @staticmethod
     def _worker_export_frame_cam(args):
-        export_dir, i_env, i_cam, camera_name, rgb, depth_normalized, i_step = args
+        export_dir, i_env, i_cam, camera_name, rgb, depth, i_step = args
         if rgb is not None:
             FrameImageExporter._export_frame_rgb_cam(export_dir, i_env, i_cam, camera_name, i_step, rgb)
-        if depth_normalized is not None:
-            FrameImageExporter._export_frame_depth_cam(export_dir, i_env, i_cam, camera_name, i_step, depth_normalized)
+        if depth is not None:
+            FrameImageExporter._export_frame_depth_cam(export_dir, i_env, i_cam, camera_name, i_step, depth)
 
     def __init__(self, export_dir, depth_clip_max=100, depth_scale='log'):
         self.export_dir = export_dir
@@ -56,9 +56,9 @@ class FrameImageExporter:
     def _get_camera_name(self, i_cam):
         return 'cam' + str(i_cam)
 
-    def export_frame_batch_cam(self, i_step, camera_idx=None, rgb=None, depth=None):
+    def export_frame_all_cams(self, i_step, camera_idx=None, rgb=None, depth=None):
         """
-        Export frames for a batch of environments and cameras.
+        Export frames for all cameras.
 
         Args:
             i_step: The current step index.
@@ -66,16 +66,25 @@ class FrameImageExporter:
             rgb: RGB image tensor of shape (n_envs, n_cams, H, W, 3).
             depth: Depth tensor of shape (n_envs, n_cams, H, W).
         """
+        if rgb is None and depth is None:
+            print("No rgb or depth to export")
+            return
 
-        assert rgb.ndim == 5 and depth.ndim == 5, "rgb and depth must be of shape (n_envs, n_cams, H, W, 3)"
+        if rgb is not None:
+            if rgb.ndim == 4:
+                rgb = rgb.unsqueeze(0)
+            assert rgb.ndim == 5, "rgb must be of shape (n_envs, n_cams, H, W, 3)"
+        if depth is not None:
+            if depth.ndim == 4:
+                depth = depth.unsqueeze(0)
+            depth = self._normalize_depth(depth)
+            assert depth.ndim == 5, "depth must be of shape (n_envs, n_cams, H, W, 1)"
         
         if camera_idx is None:
-            camera_idx = range(rgb.shape[1])
-        
-        depth_normalized = self._normalize_depth(depth) if depth is not None else None
-        
-        args_list = [(self.export_dir, i_env, i_cam, self._get_camera_name(i_cam), rgb, depth_normalized, i_step) 
-                     for i_env in range(rgb.shape[0]) for i_cam in camera_idx]
+            camera_idx = range(rgb.shape[1]) if rgb is not None else range(depth.shape[1])
+        env_idx = range(rgb.shape[0]) if rgb is not None else range(depth.shape[0])
+        args_list = [(self.export_dir, i_env, i_cam, self._get_camera_name(i_cam), rgb, depth, i_step) 
+                     for i_env in env_idx for i_cam in camera_idx]
         with ThreadPoolExecutor() as executor:
             executor.map(FrameImageExporter._worker_export_frame_cam, args_list)
 
@@ -89,30 +98,37 @@ class FrameImageExporter:
             rgb: RGB image tensor of shape (n_envs, H, W, 3).
             depth: Depth tensor of shape (n_envs, H, W).
         """
-        # Move rgb and depth to torch tensor
-        if isinstance(rgb, np.ndarray):
-            rgb = torch.from_numpy(rgb.copy())
-        if isinstance(depth, np.ndarray):
-            depth = torch.from_numpy(depth.copy())
-        
-        # Unsqueeze rgb and depth to (n_envs, 1, H, W, 3) and (n_envs, 1, H, W, 1)
-        if rgb.ndim == 4:
-            rgb = rgb.unsqueeze(1)
-        elif rgb.ndim == 3:
-            rgb = rgb.unsqueeze(0).unsqueeze(0)
-        else:
-            raise ValueError(f"Invalid rgb shape: {rgb.shape}")
-        
-        if depth.ndim == 4:
-            depth = depth.unsqueeze(1)
-        elif depth.ndim == 2:
-            depth = depth.unsqueeze(0).unsqueeze(0).unsqueeze(4)
-        else:
-            raise ValueError(f"Invalid depth shape: {depth.shape}")
+        if rgb is not None:
+            if isinstance(rgb, np.ndarray):
+                rgb = torch.from_numpy(rgb.copy())
 
-        depth_normalized = self._normalize_depth(depth) if depth is not None else None
-        
-        args_list = [(self.export_dir, i_env, 0, self._get_camera_name(i_cam), rgb, depth_normalized, i_step) 
-                     for i_env in range(rgb.shape[0])]
+            # Unsqueeze rgb to (n_envs, 1, H, W, 3) if n_envs > 0
+            if rgb.ndim == 4:
+                rgb = rgb.unsqueeze(1)
+            elif rgb.ndim == 3:
+                rgb = rgb.unsqueeze(0).unsqueeze(0)
+            else:
+                raise ValueError(f"Invalid rgb shape: {rgb.shape}")
+            assert rgb.ndim == 5, "rgb must be of shape (n_envs, H, W, 3)"
+
+        if depth is not None:
+            if isinstance(depth, np.ndarray):
+                depth = torch.from_numpy(depth.copy())
+
+            # Unsqueeze depth to (n_envs, 1, H, W, 1) if n_envs > 0
+            if depth.ndim == 4:
+                depth = depth.unsqueeze(1)
+            elif depth.ndim == 3:
+                depth = depth.unsqueeze(0).unsqueeze(0)
+            elif depth.ndim == 2:
+                depth = depth.unsqueeze(0).unsqueeze(0).unsqueeze(4)
+            else:
+                raise ValueError(f"Invalid depth shape: {depth.shape}")                    
+            depth = self._normalize_depth(depth)
+            assert depth.ndim == 5, "depth must be of shape (n_envs, H, W, 1)"
+            
+        env_idx = range(rgb.shape[0]) if rgb is not None else range(depth.shape[0])
+        args_list = [(self.export_dir, i_env, 0, self._get_camera_name(i_cam), rgb, depth, i_step) 
+                     for i_env in env_idx]
         with ThreadPoolExecutor() as executor:
             executor.map(FrameImageExporter._worker_export_frame_cam, args_list) 

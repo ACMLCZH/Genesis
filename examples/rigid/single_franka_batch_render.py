@@ -76,12 +76,12 @@ def main():
     ########################## build ##########################
     n_envs = 3
     n_steps = 2
-    do_batch_export = True
+    is_render_all_cams = True
     scene.build(n_envs=n_envs)
 
     # Warmup
     scene.step()
-    rgb, depth, _, _ = scene.batch_render()
+    rgb, depth, _, _ = scene.render_all_cams()
 
     # Create an image exporter
     output_dir = 'img_output/test'
@@ -93,18 +93,19 @@ def main():
 
     for i in range(n_steps):
         scene.step()
-        if do_batch_export:
-            rgb, depth, _, _ = scene.batch_render()
-            exporter.export_frame_batch_cam(i, rgb=rgb, depth=depth)
+        if is_render_all_cams:
+            rgb, depth, _, _ = scene.render_all_cams()
+            exporter.export_frame_all_cams(i, rgb=rgb, depth=depth)
         else:
             rgb, depth, _, _ = cam_0.render()
             exporter.export_frame_single_cam(i, cam_0.idx, rgb=rgb, depth=depth)
     
     end_time = time()
+    actual_n_envs = n_envs if n_envs > 0 else 1
     print(f'n_envs: {n_envs}')
     print(f'Time taken: {end_time - start_time} seconds')
-    print(f'Time taken per env: {(end_time - start_time) / n_envs} seconds')
-    print(f'FPS: {n_envs * n_steps / (end_time - start_time)}')
+    print(f'Time taken per env: {(end_time - start_time) / actual_n_envs} seconds')
+    print(f'FPS: {actual_n_envs * n_steps / (end_time - start_time)}')
     print(f'FPS per env: {n_steps / (end_time - start_time)}')
 
 

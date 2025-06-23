@@ -173,11 +173,11 @@ class RigidOptions(Options):
     sparse_solve : bool, optional
         Whether to exploit sparsity in the constraint system. Defaults to False.
     contact_resolve_time : float, optional
-        Please note that this option will be deprecated in a future version. Use 'constraint_resolve_time' instead.
-    constraint_resolve_time : float, optional
+        Please note that this option will be deprecated in a future version. Use 'constraint_timeconst' instead.
+    constraint_timeconst : float, optional
         Time to resolve a constraint. The smaller the value, the more stiff the constraint. This parameter is called
-        'timeconst' in Mujoco (https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters).
-        Defaults to 0.02.
+        'timeconst' in Mujoco (https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters). None to
+        disable. Defaults to None.
     use_contact_island : bool, optional
         Whether to use contact island to speed up contact resolving. Defaults to False.
     use_hibernation : bool, optional
@@ -218,7 +218,7 @@ class RigidOptions(Options):
     ls_tolerance: float = 1e-2
     sparse_solve: bool = False
     contact_resolve_time: Optional[float] = None
-    constraint_resolve_time: Optional[float] = None
+    constraint_timeconst: Optional[float] = None
     use_contact_island: bool = False
     box_box_detection: bool = (
         False  # collision detection branch for box-box pair, slower but more stable. (Follows mujoco's implementation: https://github.com/google-deepmind/mujoco/blob/main/src/engine/engine_collision_box.c)
@@ -510,12 +510,37 @@ class FEMOptions(Options):
         Damping factor. Defaults to 45.0.
     floor_height : float, optional
         Height of the floor in meters. If none, it will inherit from `SimOptions`. Defaults to None.
+    use_implicit_solver : bool, optional
+        Whether to use the implicit solver. Defaults to False.
+        Implicit solver is a more stable solver for FEM. It can be used with a large time step.
+    n_newton_iterations : int, optional
+        Maximum number of Newton iterations. Defaults to 5. Only used when `use_implicit_solver` is True.
+    n_pcg_iterations : int, optional
+        Maximum number of PCG iterations. Defaults to 100. Only used when `use_implicit_solver` is True.
+    n_linesearch_iterations : int, optional
+        Maximum number of line search iterations. Defaults to 10. Only used when `use_implicit_solver` is True.
+    newton_dx_threshold : float, optional
+        Threshold for the Newton solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True.
+    pcg_threshold : float, optional
+        Threshold for the PCG solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True.
+    linesearch_c : float, optional
+        Line search sufficient decrease parameter. Defaults to 1e-4. Only used when `use_implicit_solver` is True.
+    linesearch_tau : float, optional
+        Line search step size reduction factor. Defaults to 0.5. Only used when `use_implicit_solver` is True.
     """
 
     dt: Optional[float] = None
     gravity: Optional[tuple] = None
     damping: Optional[float] = 0.0
     floor_height: float = None
+    use_implicit_solver: bool = False
+    n_newton_iterations: int = 5
+    n_pcg_iterations: int = 100
+    n_linesearch_iterations: int = 10
+    newton_dx_threshold: float = 1e-6
+    pcg_threshold: float = 1e-6
+    linesearch_c: float = 1e-4
+    linesearch_tau: float = 0.5
 
 
 class SFOptions(Options):

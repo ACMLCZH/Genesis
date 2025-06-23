@@ -1,10 +1,13 @@
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 import numpy as np
 import torch
+import numpy.typing as npt
 import taichi as ti
 
 import genesis as gs
+from genesis.engine.entities.base_entity import Entity
+from genesis.options.solvers import RigidOptions
 import genesis.utils.geom as gu
 from genesis.utils.misc import ti_field_to_torch, DeprecationError, ALLOCATE_TENSOR_WARNING
 from genesis.engine.entities import AvatarEntity, DroneEntity, RigidEntity
@@ -17,6 +20,10 @@ from .constraint_solver_decomp import ConstraintSolver
 from .constraint_solver_decomp_island import ConstraintSolverIsland
 from .sdf_decomp import SDF
 
+if TYPE_CHECKING:
+    from genesis.engine.scene import Scene
+    from genesis.engine.simulator import Simulator
+
 
 # minimum constraint impedance
 IMP_MIN = 0.0001
@@ -27,28 +34,29 @@ IMP_MAX = 0.9999
 TIME_CONSTANT_SAFETY_FACTOR = 2.0
 
 
-def _sanitize_sol_params(sol_params, min_resolve_time, force_resolve_time=None):
-    timeconst, dampratio, dmin, dmax, width, mid, power = sol_params.T
-    if force_resolve_time is not None:
-        timeconst = np.full_like(timeconst, force_resolve_time)
+def _sanitize_sol_params(
+    sol_params: npt.NDArray[np.float64], min_timeconst: float, global_timeconst: float | None = None
+):
+    assert sol_params.shape[-1] == 7
+    timeconst, dampratio, dmin, dmax, width, mid, power = sol_params.reshape((-1, 7)).T
+    if global_timeconst is not None:
+        timeconst[:] = global_timeconst
     if (timeconst < gs.EPS).any():
         # We deliberately set timeconst to be zero for urdf and meshes so that it can fall back to 2*dt
-        gs.logger.debug(
-            f"Constraint solver time constant not specified. Using minimum value (`{min_resolve_time:0.6g}`)."
-        )
-    if ((timeconst > gs.EPS) & (timeconst + gs.EPS < min_resolve_time)).any():
+        gs.logger.debug(f"Constraint solver time constant not specified. Using minimum value (`{min_timeconst:0.6g}`).")
+    if ((timeconst > gs.EPS) & (timeconst + gs.EPS < min_timeconst)).any():
         gs.logger.warning(
             "Constraint solver time constant was increased to avoid numerical instability (from "
-            f"`{np.min(timeconst):0.6g}` to `{min_resolve_time:0.6g}`). Decrease simulation timestep to avoid "
+            f"`{timeconst.min():0.6g}` to `{min_timeconst:0.6g}`). Decrease simulation timestep to avoid "
             "altering the original value."
         )
-    timeconst = np.maximum(timeconst, min_resolve_time)
-    dmin = np.clip(dmin, IMP_MIN, IMP_MAX)
-    dmax = np.clip(dmax, IMP_MIN, IMP_MAX)
-    mid = np.clip(mid, IMP_MIN, IMP_MAX)
-    width = np.maximum(0, width)
-    power = np.maximum(1, power)
-    return np.stack([timeconst, dampratio, dmin, dmax, width, mid, power], axis=1)
+    timeconst[:] = timeconst.clip(min_timeconst)
+    dampratio[:] = dampratio.clip(0.0)
+    dmin[:] = dmin.clip(IMP_MIN, IMP_MAX)
+    dmax[:] = dmax.clip(IMP_MIN, IMP_MAX)
+    mid[:] = mid.clip(IMP_MIN, IMP_MAX)
+    width[:] = width.clip(0.0)
+    power[:] = power.clip(1)
 
 
 @ti.data_oriented
@@ -57,7 +65,7 @@ class RigidSolver(Solver):
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
-    def __init__(self, scene, sim, options):
+    def __init__(self, scene: "Scene", sim: "Simulator", options: "RigidOptions") -> None:
         super().__init__(scene, sim, options)
 
         # options
@@ -82,37 +90,37 @@ class RigidSolver(Solver):
         self._hibernation_thresh_vel = options.hibernation_thresh_vel
         self._hibernation_thresh_acc = options.hibernation_thresh_acc
 
-        self._sol_constraint_min_resolve_time = TIME_CONSTANT_SAFETY_FACTOR * self._substep_dt
-        self._sol_constraint_resolve_time = options.constraint_resolve_time
+        self._sol_min_timeconst = TIME_CONSTANT_SAFETY_FACTOR * self._substep_dt
+        self._sol_global_timeconst = options.constraint_timeconst
 
         if options.contact_resolve_time is not None:
-            self._sol_contact_resolve_time = options.contact_resolve_time
+            self._sol_contact_timeconst = options.contact_resolve_time
             gs.logger.warning(
                 "Rigid option 'contact_resolve_time' is deprecated and will be remove in future release. Please use "
-                "'constraint_resolve_time' instead."
+                "'constraint_timeconst' instead."
             )
 
         self._options = options
 
         self._cur_step = -1
 
-    def add_entity(self, idx, material, morph, surface, visualize_contact):
+    def add_entity(self, idx, material, morph, surface, visualize_contact) -> Entity:
         if isinstance(material, gs.materials.Avatar):
-            entity_class = AvatarEntity
+            EntityClass = AvatarEntity
             if visualize_contact:
                 gs.raise_exception("AvatarEntity does not support visualize_contact")
         else:
             if isinstance(morph, gs.morphs.Drone):
-                entity_class = DroneEntity
+                EntityClass = DroneEntity
             else:
-                entity_class = RigidEntity
+                EntityClass = RigidEntity
 
         if morph.is_free:
             verts_state_start = self.n_free_verts
         else:
             verts_state_start = self.n_fixed_verts
 
-        entity = entity_class(
+        entity = EntityClass(
             scene=self._scene,
             solver=self,
             material=material,
@@ -212,70 +220,116 @@ class RigidSolver(Solver):
             self._init_collider()
             self._init_constraint_solver()
 
-            # run complete FK once to update geoms state and mass matrix
+            # Compute state in neutral configuration at rest
             self._kernel_forward_kinematics_links_geoms(self._scene._envs_idx)
 
             self._init_invweight()
             self._kernel_init_meaninertia()
 
     def _init_invweight(self):
-        self._kernel_forward_dynamics()
+        # Early return if no DoFs. This is essential to avoid segfault on CUDA.
+        if self._n_dofs == 0:
+            return
 
-        cdof_ang = self.dofs_state.cdof_ang.to_numpy()[:, 0, :]
-        cdof_vel = self.dofs_state.cdof_vel.to_numpy()[:, 0, :]
+        # Compute mass matrix without any implicit damping terms
+        self._kernel_compute_mass_matrix()
 
+        # Define some proxies for convenience
         mass_mat = self.mass_mat.to_numpy()[:, :, 0]
-        dof_start = self.links_info.dof_start.to_numpy()
-        dof_end = self.links_info.dof_end.to_numpy()
-        n_dofs = self.links_info.n_dofs.to_numpy()
-        parent_idx = self.links_info.parent_idx.to_numpy()
+        offsets = self.links_state.i_pos.to_numpy()[:, 0]
+        cdof_ang = self.dofs_state.cdof_ang.to_numpy()[:, 0]
+        cdof_vel = self.dofs_state.cdof_vel.to_numpy()[:, 0]
+        links_joint_start = self.links_info.joint_start.to_numpy()
+        links_joint_end = self.links_info.joint_end.to_numpy()
+        links_dof_end = self.links_info.dof_end.to_numpy()
+        links_n_dofs = self.links_info.n_dofs.to_numpy()
+        links_parent_idx = self.links_info.parent_idx.to_numpy()
+        joints_type = self.joints_info.type.to_numpy()
+        joints_dof_start = self.joints_info.dof_start.to_numpy()
+        joints_n_dofs = self.joints_info.n_dofs.to_numpy()
         if self._options.batch_links_info:
-            dof_start = dof_start[:, 0]
-            dof_end = dof_end[:, 0]
-            n_dofs = n_dofs[:, 0]
-            parent_idx = parent_idx[:, 0]
+            links_joint_start = links_joint_start[:, 0]
+            links_joint_end = links_joint_end[:, 0]
+            links_dof_end = links_dof_end[:, 0]
+            links_n_dofs = links_n_dofs[:, 0]
+            links_parent_idx = links_parent_idx[:, 0]
+        if self._options.batch_joints_info:
+            joints_type = joints_type[:, 0]
+            joints_dof_start = joints_dof_start[:, 0]
+            joints_n_dofs = joints_n_dofs[:, 0]
 
-        offsets = self.links_state.i_pos.to_numpy()[:, 0, :]
+        # Compute links invweight
+        links_invweight = np.zeros((self._n_links, 2), dtype=gs.np_float)
+        for i_l in range(self._n_links):
+            jacp = np.zeros((3, self._n_dofs))
+            jacr = np.zeros((3, self._n_dofs))
 
-        invweight = np.zeros([self._n_links, 2], dtype=gs.np_float)
+            offset = offsets[i_l]
 
-        if self._n_dofs > 0:
-            for i_link in range(self._n_links):
-                jacp = np.zeros([self._n_dofs, 3])
-                jacr = np.zeros([self._n_dofs, 3])
+            j_l = i_l
+            while j_l != -1:
+                for i_d_ in range(links_n_dofs[j_l]):
+                    i_d = links_dof_end[j_l] - i_d_ - 1
+                    jacp[:, i_d] = cdof_vel[i_d] + np.cross(cdof_ang[i_d], offset)
+                    jacr[:, i_d] = cdof_ang[i_d]
+                j_l = links_parent_idx[j_l]
 
-                offset = offsets[i_link]
+            jac = np.concatenate((jacp, jacr), axis=0)
 
-                this_link = i_link
-                while this_link != -1:
-                    for i_d_ in range(dof_end[this_link] - dof_start[this_link]):
-                        i_d = dof_end[this_link] - i_d_ - 1
-                        jacr[i_d] = cdof_ang[i_d]
+            A = jac @ np.linalg.inv(mass_mat) @ jac.T
+            A_diag = np.diag(A)
 
-                        tmp = np.cross(cdof_ang[i_d], offset)
-                        jacp[i_d] = cdof_vel[i_d] + tmp
+            links_invweight[i_l, 0] = A_diag[:3].mean()
+            links_invweight[i_l, 1] = A_diag[3:].mean()
 
-                    this_link = parent_idx[this_link]
+        # Compute dofs invweight
+        dofs_invweight = np.zeros((self._n_dofs,), dtype=gs.np_float)
+        for i_l in range(self._n_links):
+            for i_j in range(links_joint_start[i_l], links_joint_end[i_l]):
+                joint_type = joints_type[i_j]
+                if joint_type == gs.JOINT_TYPE.FIXED:
+                    continue
 
-                jac = np.concatenate([jacp, jacr], 1)
+                dof_start = joints_dof_start[i_j]
+                n_dofs = joints_n_dofs[i_j]
+                jac = np.zeros((n_dofs, self._n_dofs))
+                for i_d_ in range(n_dofs):
+                    jac[i_d_, dof_start + i_d_] = 1.0
 
-                A = jac.T @ np.linalg.inv(mass_mat) @ jac
+                A = jac @ np.linalg.inv(mass_mat) @ jac.T
+                A_diag = np.diag(A)
 
-                invweight[i_link, 0] = (A[0, 0] + A[1, 1] + A[2, 2]) / 3
-                invweight[i_link, 1] = (A[3, 3] + A[4, 4] + A[5, 5]) / 3
+                if joint_type == gs.JOINT_TYPE.FREE:
+                    dofs_invweight[dof_start : (dof_start + 3)] = A_diag[:3].mean()
+                    dofs_invweight[(dof_start + 3) : (dof_start + 6)] = A_diag[3:].mean()
+                elif joint_type == gs.JOINT_TYPE.SPHERICAL:
+                    dofs_invweight[dof_start : (dof_start + 3)] = A_diag[:3].mean()
+                else:  # REVOLUTE or PRISMATIC
+                    dofs_invweight[dof_start] = A_diag[0]
 
-        self._kernel_init_invweight(invweight)
+        # Update links and dofs invweight for values that are not already pre-computed
+        self._kernel_init_invweight(links_invweight, dofs_invweight)
+
+    @ti.kernel
+    def _kernel_compute_mass_matrix(self):
+        self._func_compute_mass_matrix(implicit_damping=False)
 
     @ti.kernel
     def _kernel_init_invweight(
         self,
-        invweight: ti.types.ndarray(),
+        links_invweight: ti.types.ndarray(),
+        dofs_invweight: ti.types.ndarray(),
     ):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for I in ti.grouped(self.links_info):
             for j in range(2):
-                if self.links_info[I].invweight[j] < 0:
-                    self.links_info[I].invweight[j] = invweight[I[0], j]
+                if self.links_info[I].invweight[j] < gs.EPS:
+                    self.links_info[I].invweight[j] = links_invweight[I[0], j]
+
+        ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
+        for I in ti.grouped(self.dofs_info):
+            if self.dofs_info[I].invweight < gs.EPS:
+                self.dofs_info[I].invweight = dofs_invweight[I[0]]
 
     @ti.kernel
     def _kernel_init_meaninertia(self):
@@ -343,7 +397,6 @@ class RigidSolver(Solver):
 
         struct_dof_info = ti.types.struct(
             stiffness=gs.ti_float,
-            sol_params=gs.ti_vec7,
             invweight=gs.ti_float,
             armature=gs.ti_float,
             damping=gs.ti_float,
@@ -390,21 +443,14 @@ class RigidSolver(Solver):
         )
 
         joints = self.joints
-        is_nonempty = np.concatenate([joint.dofs_motion_ang for joint in joints], dtype=gs.np_float).shape[0] > 0
-        if is_nonempty:  # handle the case where there is a link with no dofs -- otherwise may cause invalid memory
-            # Make sure that the constraints parameters are valid
-            dofs_sol_params = np.concatenate([joint.dofs_sol_params for joint in joints], dtype=gs.np_float)
-            dofs_sol_params = _sanitize_sol_params(
-                dofs_sol_params, self._sol_constraint_min_resolve_time, self._sol_constraint_resolve_time
-            )
-
+        has_dofs = sum(joint.n_dofs for joint in joints) > 0
+        if has_dofs:  # handle the case where there is a link with no dofs -- otherwise may cause invalid memory
             self._kernel_init_dof_fields(
                 dofs_motion_ang=np.concatenate([joint.dofs_motion_ang for joint in joints], dtype=gs.np_float),
                 dofs_motion_vel=np.concatenate([joint.dofs_motion_vel for joint in joints], dtype=gs.np_float),
                 dofs_limit=np.concatenate([joint.dofs_limit for joint in joints], dtype=gs.np_float),
                 dofs_invweight=np.concatenate([joint.dofs_invweight for joint in joints], dtype=gs.np_float),
                 dofs_stiffness=np.concatenate([joint.dofs_stiffness for joint in joints], dtype=gs.np_float),
-                dofs_sol_params=dofs_sol_params,
                 dofs_damping=np.concatenate([joint.dofs_damping for joint in joints], dtype=gs.np_float),
                 dofs_armature=np.concatenate([joint.dofs_armature for joint in joints], dtype=gs.np_float),
                 dofs_kp=np.concatenate([joint.dofs_kp for joint in joints], dtype=gs.np_float),
@@ -423,7 +469,6 @@ class RigidSolver(Solver):
         dofs_limit: ti.types.ndarray(),
         dofs_invweight: ti.types.ndarray(),
         dofs_stiffness: ti.types.ndarray(),
-        dofs_sol_params: ti.types.ndarray(),
         dofs_damping: ti.types.ndarray(),
         dofs_armature: ti.types.ndarray(),
         dofs_kp: ti.types.ndarray(),
@@ -441,9 +486,6 @@ class RigidSolver(Solver):
             for j in ti.static(range(2)):
                 self.dofs_info[I].limit[j] = dofs_limit[i, j]
                 self.dofs_info[I].force_range[j] = dofs_force_range[i, j]
-
-            for j in ti.static(range(7)):
-                self.dofs_info[I].sol_params[j] = dofs_sol_params[i, j]
 
             self.dofs_info[I].armature = dofs_armature[i]
             self.dofs_info[I].invweight = dofs_invweight[i]
@@ -491,18 +533,6 @@ class RigidSolver(Solver):
             inertial_mass=gs.ti_float,
             entity_idx=gs.ti_int,  # entity.idx_in_solver
         )
-
-        struct_joint_info = ti.types.struct(
-            type=gs.ti_int,
-            sol_params=gs.ti_vec7,
-            q_start=gs.ti_int,
-            dof_start=gs.ti_int,
-            q_end=gs.ti_int,
-            dof_end=gs.ti_int,
-            n_dofs=gs.ti_int,
-            pos=gs.ti_vec3,
-        )
-
         struct_link_state = ti.types.struct(
             cinr_inertial=gs.ti_mat3,
             cinr_pos=gs.ti_vec3,
@@ -516,8 +546,6 @@ class RigidSolver(Solver):
             cdd_ang=gs.ti_vec3,
             pos=gs.ti_vec3,
             quat=gs.ti_vec4,
-            ang=gs.ti_vec3,
-            vel=gs.ti_vec3,
             i_pos=gs.ti_vec3,
             i_quat=gs.ti_vec4,
             j_pos=gs.ti_vec3,
@@ -532,10 +560,13 @@ class RigidSolver(Solver):
             COM=gs.ti_vec3,
             mass_shift=gs.ti_float,
             i_pos_shift=gs.ti_vec3,
-            # cfrc_flat
-            cfrc_flat_ang=gs.ti_vec3,
-            cfrc_flat_vel=gs.ti_vec3,
-            # COM-based external force
+            # COM-based link's spatial acceleration
+            cacc_ang=gs.ti_vec3,
+            cacc_lin=gs.ti_vec3,
+            # COM-based total forces
+            cfrc_ang=gs.ti_vec3,
+            cfrc_vel=gs.ti_vec3,
+            # COM-based "true" external forces (i.e. user-specified and not resulting from any kind of constraints)
             cfrc_ext_ang=gs.ti_vec3,
             cfrc_ext_vel=gs.ti_vec3,
             # net force from external contacts
@@ -571,34 +602,43 @@ class RigidSolver(Solver):
             links_entity_idx=np.array([link._entity_idx_in_solver for link in links], dtype=gs.np_int),
         )
 
-        joints_info_shape = self._batch_shape(self.n_joints) if self._options.batch_joints_info else self.n_joints
-        self.joints_info = struct_joint_info.field(shape=joints_info_shape, needs_grad=False, layout=ti.Layout.SOA)
-
+        struct_joint_info = ti.types.struct(
+            type=gs.ti_int,
+            sol_params=gs.ti_vec7,
+            q_start=gs.ti_int,
+            dof_start=gs.ti_int,
+            q_end=gs.ti_int,
+            dof_end=gs.ti_int,
+            n_dofs=gs.ti_int,
+            pos=gs.ti_vec3,
+        )
         struct_joint_state = ti.types.struct(
             xanchor=gs.ti_vec3,
             xaxis=gs.ti_vec3,
         )
 
+        # Field size cannot be zero,
+        joints_info_shape = self._batch_shape(self.n_joints_) if self._options.batch_joints_info else self.n_joints_
+        self.joints_info = struct_joint_info.field(shape=joints_info_shape, needs_grad=False, layout=ti.Layout.SOA)
         self.joints_state = struct_joint_state.field(
-            shape=self._batch_shape(self.n_joints), needs_grad=False, layout=ti.Layout.SOA
+            shape=self._batch_shape(self.n_joints_), needs_grad=False, layout=ti.Layout.SOA
         )
 
-        # Make sure that the constraints parameters are valid
         joints = self.joints
-        joints_sol_params = np.concatenate([joint.sol_params for joint in joints], dtype=gs.np_float)
-        joints_sol_params = _sanitize_sol_params(
-            joints_sol_params, self._sol_constraint_min_resolve_time, self._sol_constraint_resolve_time
-        )
+        if joints:
+            # Make sure that the constraints parameters are valid
+            joints_sol_params = np.array([joint.sol_params for joint in joints], dtype=gs.np_float)
+            _sanitize_sol_params(joints_sol_params, self._sol_min_timeconst, self._sol_global_timeconst)
 
-        self._kernel_init_joint_fields(
-            joints_type=np.array([joint.type for joint in joints], dtype=gs.np_int),
-            joints_sol_params=joints_sol_params,
-            joints_q_start=np.array([joint.q_start for joint in joints], dtype=gs.np_int),
-            joints_dof_start=np.array([joint.dof_start for joint in joints], dtype=gs.np_int),
-            joints_q_end=np.array([joint.q_end for joint in joints], dtype=gs.np_int),
-            joints_dof_end=np.array([joint.dof_end for joint in joints], dtype=gs.np_int),
-            joints_pos=np.array([joint.pos for joint in joints], dtype=gs.np_float),
-        )
+            self._kernel_init_joint_fields(
+                joints_type=np.array([joint.type for joint in joints], dtype=gs.np_int),
+                joints_sol_params=joints_sol_params,
+                joints_q_start=np.array([joint.q_start for joint in joints], dtype=gs.np_int),
+                joints_dof_start=np.array([joint.dof_start for joint in joints], dtype=gs.np_int),
+                joints_q_end=np.array([joint.q_end for joint in joints], dtype=gs.np_int),
+                joints_dof_end=np.array([joint.dof_end for joint in joints], dtype=gs.np_int),
+                joints_pos=np.array([joint.pos for joint in joints], dtype=gs.np_float),
+            )
 
         self.qpos0 = ti.field(dtype=gs.ti_float, shape=self._batch_shape(self.n_qs_))
         if self.n_qs > 0:
@@ -924,9 +964,7 @@ class RigidSolver(Solver):
             # Make sure that the constraints parameters are valid
             geoms = self.geoms
             geoms_sol_params = np.array([geom.sol_params for geom in geoms], dtype=gs.np_float)
-            geoms_sol_params = _sanitize_sol_params(
-                geoms_sol_params, self._sol_constraint_min_resolve_time, self._sol_constraint_resolve_time
-            )
+            _sanitize_sol_params(geoms_sol_params, self._sol_min_timeconst, self._sol_global_timeconst)
 
             # Accurately compute the center of mass of each geometry if possible.
             # Note that the mean vertex position is a bad approximation, which is impeding the ability of MPR to
@@ -1009,7 +1047,6 @@ class RigidSolver(Solver):
             for j in ti.static(range(7)):
                 self.geoms_info[i].data[j] = geoms_data[i, j]
                 self.geoms_info[i].sol_params[j] = geoms_sol_params[i, j]
-            self.geoms_info[i].sol_params[0] = ti.max(self.geoms_info[i].sol_params[0], 2 * self._substep_dt)
 
             self.geoms_info[i].vert_start = geoms_vert_start[i]
             self.geoms_info[i].vert_end = geoms_vert_end[i]
@@ -1245,17 +1282,17 @@ class RigidSolver(Solver):
             eq_type=gs.ti_int,
             sol_params=gs.ti_vec7,
         )
-        self.equality_info = struct_equality_info.field(
+        self.equalities_info = struct_equality_info.field(
             shape=self._batch_shape(self.n_equalities_candidate), needs_grad=False, layout=ti.Layout.SOA
         )
         if self.n_equalities > 0:
             equalities = self.equalities
 
             equalities_sol_params = np.array([equality.sol_params for equality in equalities], dtype=gs.np_float)
-            equalities_sol_params = _sanitize_sol_params(
+            _sanitize_sol_params(
                 equalities_sol_params,
-                self._sol_constraint_min_resolve_time,
-                self._sol_constraint_resolve_time,
+                self._sol_min_timeconst,
+                self._sol_global_timeconst,
             )
 
             self._kernel_init_equality_fields(
@@ -1282,13 +1319,13 @@ class RigidSolver(Solver):
 
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i, b in ti.ndrange(self.n_equalities, self._B):
-            self.equality_info[i, b].eq_obj1id = equalities_eq_obj1id[i]
-            self.equality_info[i, b].eq_obj2id = equalities_eq_obj2id[i]
-            self.equality_info[i, b].eq_type = equalities_eq_type[i]
+            self.equalities_info[i, b].eq_obj1id = equalities_eq_obj1id[i]
+            self.equalities_info[i, b].eq_obj2id = equalities_eq_obj2id[i]
+            self.equalities_info[i, b].eq_type = equalities_eq_type[i]
             for j in ti.static(range(11)):
-                self.equality_info[i, b].eq_data[j] = equalities_eq_data[i, j]
+                self.equalities_info[i, b].eq_data[j] = equalities_eq_data[i, j]
             for j in ti.static(range(7)):
-                self.equality_info[i, b].sol_params[j] = equalities_sol_params[i, j]
+                self.equalities_info[i, b].sol_params[j] = equalities_sol_params[i, j]
 
     def _init_envs_offset(self):
         self.envs_offset = ti.Vector.field(3, dtype=gs.ti_float, shape=self._B)
@@ -1334,12 +1371,12 @@ class RigidSolver(Solver):
         Velocity of a certain point on a rigid link.
         """
         link_state = self.links_state[link_idx, i_b]
-        vel_rot = link_state.ang.cross(pos_world - link_state.COM)
-        vel_lin = link_state.vel
+        vel_rot = link_state.cd_ang.cross(pos_world - link_state.COM)
+        vel_lin = link_state.cd_vel
         return vel_rot + vel_lin
 
     @ti.func
-    def _func_compute_mass_matrix(self):
+    def _func_compute_mass_matrix(self, implicit_damping: ti.template()):
         if ti.static(self._use_hibernation):
             # crb initialize
             ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
@@ -1415,7 +1452,7 @@ class RigidSolver(Solver):
                         self.mass_mat[i_d, i_d, i_b] = self.mass_mat[i_d, i_d, i_b] + self.dofs_info[I_d].armature
 
                     # Take into account first-order correction terms for implicit integration scheme right away
-                    if ti.static(self._integrator == gs.integrator.approximate_implicitfast):
+                    if ti.static(implicit_damping):
                         for i_d in range(e_info.dof_start, e_info.dof_end):
                             I_d = [i_d, i_b] if ti.static(self._options.batch_dofs_info) else i_d
                             self.mass_mat[i_d, i_d, i_b] += self.dofs_info[I_d].damping * self._substep_dt
@@ -1493,7 +1530,7 @@ class RigidSolver(Solver):
                 self.mass_mat[i_d, i_d, i_b] = self.mass_mat[i_d, i_d, i_b] + self.dofs_info[I_d].armature
 
             # Take into account first-order correction terms for implicit integration scheme right away
-            if ti.static(self._integrator == gs.integrator.approximate_implicitfast):
+            if ti.static(implicit_damping):
                 ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
                 for i_d, i_b in ti.ndrange(self.n_dofs, self._B):
                     I_d = [i_d, i_b] if ti.static(self._options.batch_dofs_info) else i_d
@@ -1505,7 +1542,7 @@ class RigidSolver(Solver):
                         self.mass_mat[i_d, i_d, i_b] += self.dofs_info[I_d].kv * self._substep_dt
 
     @ti.func
-    def _func_factor_mass(self, implicit_damping):
+    def _func_factor_mass(self, implicit_damping: ti.template()):
         """
         Compute Cholesky decomposition (L^T @ D @ L) of mass matrix.
         """
@@ -1524,7 +1561,7 @@ class RigidSolver(Solver):
                             for j_d in range(entity_dof_start, i_d + 1):
                                 self.mass_mat_L[i_d, j_d, i_b] = self.mass_mat[i_d, j_d, i_b]
 
-                            if implicit_damping:
+                            if ti.static(implicit_damping):
                                 I_d = [i_d, i_b] if ti.static(self._options.batch_dofs_info) else i_d
                                 self.mass_mat_L[i_d, i_d, i_b] += self.dofs_info[I_d].damping * self._substep_dt
                                 if ti.static(self._integrator == gs.integrator.implicitfast):
@@ -1558,7 +1595,7 @@ class RigidSolver(Solver):
                         for j_d in range(entity_dof_start, i_d + 1):
                             self.mass_mat_L[i_d, j_d, i_b] = self.mass_mat[i_d, j_d, i_b]
 
-                        if implicit_damping:
+                        if ti.static(implicit_damping):
                             I_d = [i_d, i_b] if ti.static(self._options.batch_dofs_info) else i_d
                             self.mass_mat_L[i_d, i_d, i_b] += self.dofs_info[I_d].damping * self._substep_dt
                             if ti.static(self._integrator == gs.integrator.implicitfast):
@@ -1642,19 +1679,25 @@ class RigidSolver(Solver):
     def _kernel_forward_dynamics(self):
         self._func_forward_dynamics()
 
+    @ti.kernel
+    def _kernel_update_acc(self):
+        self._func_update_acc(update_cacc=True)
+
     # @@@@@@@@@ Composer starts here
     # decomposed kernels should happen in the block below. This block will be handled by composer and composed into a single kernel
     @ti.func
     def _func_forward_dynamics(self):
-        self._func_compute_mass_matrix()
+        self._func_compute_mass_matrix(
+            implicit_damping=ti.static(self._integrator == gs.integrator.approximate_implicitfast)
+        )
         self._func_factor_mass(implicit_damping=False)
         self._func_torque_and_passive_force()
-        self._func_system_update_acc(False)
-        self._func_system_update_force()
-        self._func_inverse_link_force()
+        self._func_update_acc(update_cacc=False)
+        self._func_update_force()
         # self._func_actuation()
         self._func_bias_force()
         self._func_compute_qacc()
+        # FIXME: External forces should be cleared at the end of the step, not during substeps.
         self._func_clear_external_force()
 
     def substep(self):
@@ -1668,6 +1711,13 @@ class RigidSolver(Solver):
         self._func_constraint_force()
         timer.stamp("constraint_force")
 
+        # Position, Velocity and Acceleration data must be consistent when computing links acceleration, otherwise it
+        # would not corresponds to anyting physical. There is no other way than doing this right before integration,
+        # because the acceleration at the end of the step is unknown for now as it may change discontinuous between
+        # before and after integration under the effect of external forces and constraints. This means that
+        # acceleration data will be shifted one timestep in the past, but there isn't really any way around.
+        self._kernel_update_acc()
+
         self._kernel_step_2()
         timer.stamp("kernel_step_2")
 
@@ -1676,7 +1726,7 @@ class RigidSolver(Solver):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
         for i_b in range(self._B):
             self._func_forward_kinematics(i_b)
-            self._func_transform_COM(i_b)
+            self._func_COM_links(i_b)
             self._func_forward_velocity(i_b)
             self._func_update_geoms(i_b)
 
@@ -1722,13 +1772,6 @@ class RigidSolver(Solver):
             self._func_hibernate()
             self._func_aggregate_awake_entities()
 
-        ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
-        for i_b in range(self._B):
-            self._func_forward_kinematics(i_b)
-            self._func_transform_COM(i_b)
-            self._func_forward_velocity(i_b)
-            self._func_update_geoms(i_b)
-
     def _kernel_detect_collision(self):
         self.collider.clear()
         self.collider.detection()
@@ -1749,7 +1792,7 @@ class RigidSolver(Solver):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
         for i_b in envs_idx:
             self._func_forward_kinematics(i_b)
-            self._func_transform_COM(i_b)
+            self._func_COM_links(i_b)
             self._func_forward_velocity(i_b)
             self._func_update_geoms(i_b)
 
@@ -1757,7 +1800,7 @@ class RigidSolver(Solver):
         from genesis.utils.tools import create_timer
 
         timer = create_timer(name="constraint_force", level=2, ti_sync=True, skip_first_call=True)
-        if self._enable_collision or self._enable_joint_limit:
+        if self._enable_collision or self._enable_joint_limit or self.n_equalities > 0:
             self.constraint_solver.clear()
         timer.stamp("constraint_solver.clear")
 
@@ -2021,9 +2064,10 @@ class RigidSolver(Solver):
 
                 i_r = self.links_info[I_l].root_idx
                 if i_l == i_r:
-                    self.links_state[i_l, i_b].root_COM = (
-                        self.links_state[i_l, i_b].root_COM / self.links_state[i_l, i_b].mass_sum
-                    )
+                    if self.links_state[i_l, i_b].mass_sum > 0.0:
+                        self.links_state[i_l, i_b].root_COM = (
+                            self.links_state[i_l, i_b].root_COM / self.links_state[i_l, i_b].mass_sum
+                        )
 
             ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
             for i_l in range(self.n_links):
@@ -2140,166 +2184,6 @@ class RigidSolver(Solver):
                         )
 
     @ti.func
-    def _func_COM_cd(self, i_b):
-        if ti.static(self._use_hibernation):
-            ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
-            for i_e_ in range(self.n_awake_entities[i_b]):
-                i_e = self.awake_entities[i_e_, i_b]
-
-                e_info = self.entities_info[i_e]
-                for i_l in range(e_info.link_start, e_info.link_end):
-                    l_info = self.links_info[i_l]
-                    i_p = l_info.parent_idx
-
-                    cd_vel = ti.Vector.zero(gs.ti_float, 3)
-                    cd_ang = ti.Vector.zero(gs.ti_float, 3)
-                    if i_p == -1:
-                        for i_d in range(l_info.dof_start, l_info.dof_end):
-                            cd_vel += self.dofs_state[i_d, i_b].cdofvel_vel
-                            cd_ang += self.dofs_state[i_d, i_b].cdofvel_ang
-                    else:
-                        cd_vel = self.links_state[i_p, i_b].cd_vel
-                        cd_ang = self.links_state[i_p, i_b].cd_ang
-                        for i_d in range(l_info.dof_start, l_info.dof_end):
-                            cd_vel += self.dofs_state[i_d, i_b].cdofvel_vel
-                            cd_ang += self.dofs_state[i_d, i_b].cdofvel_ang
-                    self.links_state[i_l, i_b].cd_vel = cd_vel
-                    self.links_state[i_l, i_b].cd_ang = cd_ang
-        else:
-            ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
-            for i_e in range(self.n_entities):
-                e_info = self.entities_info[i_e]
-                for i_l in range(e_info.link_start, e_info.link_end):
-                    I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
-                    l_info = self.links_info[I_l]
-                    i_p = l_info.parent_idx
-
-                    cd_vel = ti.Vector.zero(gs.ti_float, 3)
-                    cd_ang = ti.Vector.zero(gs.ti_float, 3)
-                    if i_p == -1:
-                        for i_d in range(l_info.dof_start, l_info.dof_end):
-                            cd_vel += self.dofs_state[i_d, i_b].cdofvel_vel
-                            cd_ang += self.dofs_state[i_d, i_b].cdofvel_ang
-                    else:
-                        cd_vel = self.links_state[i_p, i_b].cd_vel
-                        cd_ang = self.links_state[i_p, i_b].cd_ang
-                        for i_d in range(l_info.dof_start, l_info.dof_end):
-                            cd_vel += self.dofs_state[i_d, i_b].cdofvel_vel
-                            cd_ang += self.dofs_state[i_d, i_b].cdofvel_ang
-                    self.links_state[i_l, i_b].cd_vel = cd_vel
-                    self.links_state[i_l, i_b].cd_ang = cd_ang
-
-    @ti.func
-    def _func_COM_cdofd(self, i_b):
-        if ti.static(self._use_hibernation):
-            ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
-            for i_l_ in range(self.n_awake_links[i_b]):
-                i_l = self.awake_links[i_l_, i_b]
-                I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
-                l_info = self.links_info[I_l]
-                if l_info.n_dofs == 0:
-                    continue
-
-                i_j = l_info.joint_start
-                I_j = [i_j, i_b] if ti.static(self._options.batch_joints_info) else i_j
-                joint_type = self.joints_info[I_j].type
-
-                if joint_type == gs.JOINT_TYPE.FREE:
-                    cd_ang = ti.Vector.zero(gs.ti_float, 3)
-                    cd_vel = ti.Vector.zero(gs.ti_float, 3)
-
-                    for i_d in range(l_info.dof_start, l_info.dof_start + 3):
-                        cd_ang = cd_ang + self.dofs_state[i_d, i_b].cdofvel_ang
-                        cd_vel = cd_vel + self.dofs_state[i_d, i_b].cdofvel_vel
-
-                    for i_d in range(l_info.dof_start, l_info.dof_start + 3):
-                        self.dofs_state[i_d, i_b].cdofd_ang = ti.Vector.zero(gs.ti_float, 3)
-                        self.dofs_state[i_d, i_b].cdofd_vel = ti.Vector.zero(gs.ti_float, 3)
-
-                    for i_d in range(l_info.dof_start + 3, l_info.dof_start + 6):
-                        (
-                            self.dofs_state[i_d, i_b].cdofd_ang,
-                            self.dofs_state[i_d, i_b].cdofd_vel,
-                        ) = gu.motion_cross_motion(
-                            cd_ang,
-                            cd_vel,
-                            self.dofs_state[i_d, i_b].cdof_ang,
-                            self.dofs_state[i_d, i_b].cdof_vel,
-                        )
-
-                elif joint_type == gs.JOINT_TYPE.FIXED:
-                    pass
-
-                else:
-                    for i_d in range(l_info.dof_start, l_info.dof_end):
-                        (
-                            self.dofs_state[i_d, i_b].cdofd_ang,
-                            self.dofs_state[i_d, i_b].cdofd_vel,
-                        ) = gu.motion_cross_motion(
-                            self.links_state[i_l, i_b].cd_ang,
-                            self.links_state[i_l, i_b].cd_vel,
-                            self.dofs_state[i_d, i_b].cdof_ang,
-                            self.dofs_state[i_d, i_b].cdof_vel,
-                        )
-
-        else:
-            ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
-            for i_l in range(self.n_links):
-                I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
-                l_info = self.links_info[I_l]
-                if l_info.n_dofs == 0:
-                    continue
-
-                i_j = l_info.joint_start
-                I_j = [i_j, i_b] if ti.static(self._options.batch_joints_info) else i_j
-                joint_type = self.joints_info[I_j].type
-
-                if joint_type == gs.JOINT_TYPE.FREE:
-                    cd_ang = ti.Vector.zero(gs.ti_float, 3)
-                    cd_vel = ti.Vector.zero(gs.ti_float, 3)
-
-                    for i_d in range(l_info.dof_start, l_info.dof_start + 3):
-                        cd_ang = cd_ang + self.dofs_state[i_d, i_b].cdofvel_ang
-                        cd_vel = cd_vel + self.dofs_state[i_d, i_b].cdofvel_vel
-
-                    for i_d in range(l_info.dof_start, l_info.dof_start + 3):
-                        self.dofs_state[i_d, i_b].cdofd_ang = ti.Vector.zero(gs.ti_float, 3)
-                        self.dofs_state[i_d, i_b].cdofd_vel = ti.Vector.zero(gs.ti_float, 3)
-
-                    for i_d in range(l_info.dof_start + 3, l_info.dof_start + 6):
-                        (
-                            self.dofs_state[i_d, i_b].cdofd_ang,
-                            self.dofs_state[i_d, i_b].cdofd_vel,
-                        ) = gu.motion_cross_motion(
-                            cd_ang,
-                            cd_vel,
-                            self.dofs_state[i_d, i_b].cdof_ang,
-                            self.dofs_state[i_d, i_b].cdof_vel,
-                        )
-
-                elif joint_type == gs.JOINT_TYPE.FIXED:
-                    pass
-
-                else:
-                    for i_d in range(l_info.dof_start, l_info.dof_end):
-                        (
-                            self.dofs_state[i_d, i_b].cdofd_ang,
-                            self.dofs_state[i_d, i_b].cdofd_vel,
-                        ) = gu.motion_cross_motion(
-                            self.links_state[i_l, i_b].cd_ang,
-                            self.links_state[i_l, i_b].cd_vel,
-                            self.dofs_state[i_d, i_b].cdof_ang,
-                            self.dofs_state[i_d, i_b].cdof_vel,
-                        )
-
-    @ti.func
-    def _func_transform_COM(self, i_b):
-        self._func_COM_links(i_b)
-        # TODO: Already computed in forward dynamics, but maybe here is a better place
-        # self._func_COM_cd(i_b)
-        # self._func_COM_cdofd(i_b)
-
-    @ti.func
     def _func_forward_kinematics(self, i_b):
         if ti.static(self._use_hibernation):
             ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
@@ -2409,8 +2293,8 @@ class RigidSolver(Solver):
                     self.dofs_state[dof_start, i_b].pos = self.qpos[q_start, i_b] - self.qpos0[q_start, i_b]
                     pos = pos + self.joints_state[i_j, i_b].xaxis * self.dofs_state[dof_start, i_b].pos
 
-            # Skip link pose update for fixed root links to allow the user for manually overwriting them
-            if not (l_info.is_fixed and l_info.parent_idx == -1):
+            # Skip link pose update for fixed root links to let users manually overwrite them
+            if not (l_info.parent_idx == -1 and l_info.is_fixed):
                 self.links_state[i_l, i_b].pos = pos
                 self.links_state[i_l, i_b].quat = quat
 
@@ -2489,8 +2373,6 @@ class RigidSolver(Solver):
 
             self.links_state[i_l, i_b].cd_vel = cvel_vel
             self.links_state[i_l, i_b].cd_ang = cvel_ang
-            self.links_state[i_l, i_b].vel = cvel_vel
-            self.links_state[i_l, i_b].ang = cvel_ang
 
     @ti.func
     def _func_update_geoms(self, i_b):
@@ -2949,7 +2831,7 @@ class RigidSolver(Solver):
                         )
 
     @ti.func
-    def _func_system_update_acc(self, for_sensor):
+    def _func_update_acc(self, update_cacc: ti.template()):
         if ti.static(self._use_hibernation):
             ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
             for i_b in range(self._B):
@@ -2958,88 +2840,86 @@ class RigidSolver(Solver):
                     e_info = self.entities_info[i_e]
                     for i_l in range(e_info.link_start, e_info.link_end):
                         I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
-
                         i_p = self.links_info[I_l].parent_idx
+
                         if i_p == -1:
-                            if for_sensor:
-                                self.links_state[i_l, i_b].cdd_vel = ti.Vector.zero(gs.ti_float, 3)
-                            else:
-                                self.links_state[i_l, i_b].cdd_vel = -self._gravity[None] * (
-                                    1 - e_info.gravity_compensation
-                                )
+                            self.links_state[i_l, i_b].cdd_vel = -self._gravity[None] * (
+                                1 - e_info.gravity_compensation
+                            )
                             self.links_state[i_l, i_b].cdd_ang = ti.Vector.zero(gs.ti_float, 3)
+                            if ti.static(update_cacc):
+                                self.links_state[i_l, i_b].cacc_lin = ti.Vector.zero(gs.ti_float, 3)
+                                self.links_state[i_l, i_b].cacc_ang = ti.Vector.zero(gs.ti_float, 3)
                         else:
                             self.links_state[i_l, i_b].cdd_vel = self.links_state[i_p, i_b].cdd_vel
                             self.links_state[i_l, i_b].cdd_ang = self.links_state[i_p, i_b].cdd_ang
-                            # dimension
-
-                        map_sum_vel = ti.Vector.zero(gs.ti_float, 3)
-                        map_sum_ang = ti.Vector.zero(gs.ti_float, 3)
+                            if ti.static(update_cacc):
+                                self.links_state[i_l, i_b].cacc_lin = self.links_state[i_p, i_b].cacc_lin
+                                self.links_state[i_l, i_b].cacc_ang = self.links_state[i_p, i_b].cacc_ang
 
                         for i_d in range(self.links_info[I_l].dof_start, self.links_info[I_l].dof_end):
-                            map_sum_vel = (
-                                map_sum_vel + self.dofs_state[i_d, i_b].cdofd_vel * self.dofs_state[i_d, i_b].vel
-                            )
-                            map_sum_ang = (
-                                map_sum_ang + self.dofs_state[i_d, i_b].cdofd_ang * self.dofs_state[i_d, i_b].vel
-                            )
-
-                            if for_sensor:
-                                map_sum_ang = (
-                                    map_sum_vel + self.dofs_state[i_d, i_b].cdof_vel * self.dofs_state[i_d, i_b].acc
+                            local_cdd_vel = self.dofs_state[i_d, i_b].cdofd_vel * self.dofs_state[i_d, i_b].vel
+                            local_cdd_ang = self.dofs_state[i_d, i_b].cdofd_ang * self.dofs_state[i_d, i_b].vel
+                            self.links_state[i_l, i_b].cdd_vel = self.links_state[i_l, i_b].cdd_vel + local_cdd_vel
+                            self.links_state[i_l, i_b].cdd_ang = self.links_state[i_l, i_b].cdd_ang + local_cdd_ang
+                            if ti.static(update_cacc):
+                                self.links_state[i_l, i_b].cacc_lin = (
+                                    self.links_state[i_l, i_b].cacc_lin
+                                    + local_cdd_vel
+                                    + self.dofs_state[i_d, i_b].cdof_vel * self.dofs_state[i_d, i_b].acc
                                 )
-                                map_sum_vel = (
-                                    map_sum_ang + self.dofs_state[i_d, i_b].cdofd_ang * self.dofs_state[i_d, i_b].acc
+                                self.links_state[i_l, i_b].cacc_ang = (
+                                    self.links_state[i_l, i_b].cacc_ang
+                                    + local_cdd_ang
+                                    + self.dofs_state[i_d, i_b].cdof_ang * self.dofs_state[i_d, i_b].acc
                                 )
-
-                        self.links_state[i_l, i_b].cdd_vel = self.links_state[i_l, i_b].cdd_vel + map_sum_vel
-                        self.links_state[i_l, i_b].cdd_ang = self.links_state[i_l, i_b].cdd_ang + map_sum_ang
         else:
             ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
             for i_e, i_b in ti.ndrange(self.n_entities, self._B):
                 e_info = self.entities_info[i_e]
                 for i_l in range(e_info.link_start, e_info.link_end):
                     I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
-
                     i_p = self.links_info[I_l].parent_idx
+
                     if i_p == -1:
-                        if for_sensor:
-                            self.links_state[i_l, i_b].cdd_vel = ti.Vector.zero(gs.ti_float, 3)
-                        else:
-                            self.links_state[i_l, i_b].cdd_vel = -self._gravity[None] * (
-                                1 - e_info.gravity_compensation
-                            )
+                        self.links_state[i_l, i_b].cdd_vel = -self._gravity[None] * (1 - e_info.gravity_compensation)
                         self.links_state[i_l, i_b].cdd_ang = ti.Vector.zero(gs.ti_float, 3)
+                        if ti.static(update_cacc):
+                            self.links_state[i_l, i_b].cacc_lin = ti.Vector.zero(gs.ti_float, 3)
+                            self.links_state[i_l, i_b].cacc_ang = ti.Vector.zero(gs.ti_float, 3)
                     else:
                         self.links_state[i_l, i_b].cdd_vel = self.links_state[i_p, i_b].cdd_vel
                         self.links_state[i_l, i_b].cdd_ang = self.links_state[i_p, i_b].cdd_ang
-                        # dimension
-
-                    map_sum_vel = ti.Vector.zero(gs.ti_float, 3)
-                    map_sum_ang = ti.Vector.zero(gs.ti_float, 3)
+                        if ti.static(update_cacc):
+                            self.links_state[i_l, i_b].cacc_lin = self.links_state[i_p, i_b].cacc_lin
+                            self.links_state[i_l, i_b].cacc_ang = self.links_state[i_p, i_b].cacc_ang
 
                     for i_d in range(self.links_info[I_l].dof_start, self.links_info[I_l].dof_end):
-                        map_sum_vel = map_sum_vel + self.dofs_state[i_d, i_b].cdofd_vel * self.dofs_state[i_d, i_b].vel
-                        map_sum_ang = map_sum_ang + self.dofs_state[i_d, i_b].cdofd_ang * self.dofs_state[i_d, i_b].vel
-
-                        if for_sensor:
-                            map_sum_ang = (
-                                map_sum_vel + self.dofs_state[i_d, i_b].cdof_vel * self.dofs_state[i_d, i_b].acc
+                        # cacc = cacc_parent + cdofdot * qvel + cdof * qacc
+                        local_cdd_vel = self.dofs_state[i_d, i_b].cdofd_vel * self.dofs_state[i_d, i_b].vel
+                        local_cdd_ang = self.dofs_state[i_d, i_b].cdofd_ang * self.dofs_state[i_d, i_b].vel
+                        self.links_state[i_l, i_b].cdd_vel = self.links_state[i_l, i_b].cdd_vel + local_cdd_vel
+                        self.links_state[i_l, i_b].cdd_ang = self.links_state[i_l, i_b].cdd_ang + local_cdd_ang
+                        if ti.static(update_cacc):
+                            self.links_state[i_l, i_b].cacc_lin = (
+                                self.links_state[i_l, i_b].cacc_lin
+                                + local_cdd_vel
+                                + self.dofs_state[i_d, i_b].cdof_vel * self.dofs_state[i_d, i_b].acc
                             )
-                            map_sum_vel = (
-                                map_sum_ang + self.dofs_state[i_d, i_b].cdofd_ang * self.dofs_state[i_d, i_b].acc
+                            self.links_state[i_l, i_b].cacc_ang = (
+                                self.links_state[i_l, i_b].cacc_ang
+                                + local_cdd_ang
+                                + self.dofs_state[i_d, i_b].cdof_ang * self.dofs_state[i_d, i_b].acc
                             )
-
-                    self.links_state[i_l, i_b].cdd_vel = self.links_state[i_l, i_b].cdd_vel + map_sum_vel
-                    self.links_state[i_l, i_b].cdd_ang = self.links_state[i_l, i_b].cdd_ang + map_sum_ang
 
     @ti.func
-    def _func_system_update_force(self):
+    def _func_update_force(self):
         if ti.static(self._use_hibernation):
             ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
             for i_b in range(self._B):
                 for i_l_ in range(self.n_awake_links[i_b]):
                     i_l = self.awake_links[i_l_, i_b]
+
                     f1_ang, f1_vel = gu.inertial_mul(
                         self.links_state[i_l, i_b].cinr_pos,
                         self.links_state[i_l, i_b].cinr_inertial,
@@ -3047,7 +2927,6 @@ class RigidSolver(Solver):
                         self.links_state[i_l, i_b].cdd_vel,
                         self.links_state[i_l, i_b].cdd_ang,
                     )
-
                     f2_ang, f2_vel = gu.inertial_mul(
                         self.links_state[i_l, i_b].cinr_pos,
                         self.links_state[i_l, i_b].cinr_inertial,
@@ -3059,15 +2938,24 @@ class RigidSolver(Solver):
                         self.links_state[i_l, i_b].cd_ang, self.links_state[i_l, i_b].cd_vel, f2_ang, f2_vel
                     )
 
-                    self.links_state[i_l, i_b].cfrc_flat_vel = f1_vel + f2_vel
-                    self.links_state[i_l, i_b].cfrc_flat_ang = f1_ang + f2_ang
+                    self.links_state[i_l, i_b].cfrc_vel = f1_vel + f2_vel + self.links_state[i_l, i_b].cfrc_ext_vel
+                    self.links_state[i_l, i_b].cfrc_ang = f1_ang + f2_ang + self.links_state[i_l, i_b].cfrc_ext_ang
 
-                    self.links_state[i_l, i_b].cfrc_flat_vel = (
-                        self.links_state[i_l, i_b].cfrc_ext_vel + self.links_state[i_l, i_b].cfrc_flat_vel
-                    )
-                    self.links_state[i_l, i_b].cfrc_flat_ang = (
-                        self.links_state[i_l, i_b].cfrc_ext_ang + self.links_state[i_l, i_b].cfrc_flat_ang
-                    )
+            for i_b in range(self._B):
+                for i_e_ in range(self.n_awake_entities[i_b]):
+                    i_e = self.awake_entities[i_e_, i_b]
+                    e_info = self.entities_info[i_e]
+                    for i in range(e_info.n_links):
+                        i_l = e_info.link_end - 1 - i
+                        I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
+                        i_p = self.links_info[I_l].parent_idx
+                        if i_p != -1:
+                            self.links_state[i_p, i_b].cfrc_vel = (
+                                self.links_state[i_p, i_b].cfrc_vel + self.links_state[i_l, i_b].cfrc_vel
+                            )
+                            self.links_state[i_p, i_b].cfrc_ang = (
+                                self.links_state[i_p, i_b].cfrc_ang + self.links_state[i_l, i_b].cfrc_ang
+                            )
         else:
             ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
             for i_l, i_b in ti.ndrange(self.n_links, self._B):
@@ -3078,7 +2966,6 @@ class RigidSolver(Solver):
                     self.links_state[i_l, i_b].cdd_vel,
                     self.links_state[i_l, i_b].cdd_ang,
                 )
-
                 f2_ang, f2_vel = gu.inertial_mul(
                     self.links_state[i_l, i_b].cinr_pos,
                     self.links_state[i_l, i_b].cinr_inertial,
@@ -3090,36 +2977,9 @@ class RigidSolver(Solver):
                     self.links_state[i_l, i_b].cd_ang, self.links_state[i_l, i_b].cd_vel, f2_ang, f2_vel
                 )
 
-                self.links_state[i_l, i_b].cfrc_flat_vel = f1_vel + f2_vel
-                self.links_state[i_l, i_b].cfrc_flat_ang = f1_ang + f2_ang
+                self.links_state[i_l, i_b].cfrc_vel = f1_vel + f2_vel + self.links_state[i_l, i_b].cfrc_ext_vel
+                self.links_state[i_l, i_b].cfrc_ang = f1_ang + f2_ang + self.links_state[i_l, i_b].cfrc_ext_ang
 
-                self.links_state[i_l, i_b].cfrc_flat_vel = (
-                    self.links_state[i_l, i_b].cfrc_ext_vel + self.links_state[i_l, i_b].cfrc_flat_vel
-                )
-                self.links_state[i_l, i_b].cfrc_flat_ang = (
-                    self.links_state[i_l, i_b].cfrc_ext_ang + self.links_state[i_l, i_b].cfrc_flat_ang
-                )
-
-    @ti.func
-    def _func_inverse_link_force(self):
-        if ti.static(self._use_hibernation):
-            for i_b in range(self._B):
-                for i_e_ in range(self.n_awake_entities[i_b]):
-                    i_e = self.awake_entities[i_e_, i_b]
-                    e_info = self.entities_info[i_e]
-                    for i in range(e_info.n_links):
-                        i_l = e_info.link_end - 1 - i
-                        I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
-                        i_p = self.links_info[I_l].parent_idx
-                        if i_p != -1:
-                            self.links_state[i_p, i_b].cfrc_flat_vel = (
-                                self.links_state[i_p, i_b].cfrc_flat_vel + self.links_state[i_l, i_b].cfrc_flat_vel
-                            )
-                            self.links_state[i_p, i_b].cfrc_flat_ang = (
-                                self.links_state[i_p, i_b].cfrc_flat_ang + self.links_state[i_l, i_b].cfrc_flat_ang
-                            )
-
-        else:
             ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
             for i_e, i_b in ti.ndrange(self.n_entities, self._B):
                 e_info = self.entities_info[i_e]
@@ -3128,11 +2988,11 @@ class RigidSolver(Solver):
                     I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
                     i_p = self.links_info[I_l].parent_idx
                     if i_p != -1:
-                        self.links_state[i_p, i_b].cfrc_flat_vel = (
-                            self.links_state[i_p, i_b].cfrc_flat_vel + self.links_state[i_l, i_b].cfrc_flat_vel
+                        self.links_state[i_p, i_b].cfrc_vel = (
+                            self.links_state[i_p, i_b].cfrc_vel + self.links_state[i_l, i_b].cfrc_vel
                         )
-                        self.links_state[i_p, i_b].cfrc_flat_ang = (
-                            self.links_state[i_p, i_b].cfrc_flat_ang + self.links_state[i_l, i_b].cfrc_flat_ang
+                        self.links_state[i_p, i_b].cfrc_ang = (
+                            self.links_state[i_p, i_b].cfrc_ang + self.links_state[i_l, i_b].cfrc_ang
                         )
 
     @ti.func
@@ -3170,8 +3030,8 @@ class RigidSolver(Solver):
 
                     for i_d in range(l_info.dof_start, l_info.dof_end):
                         self.dofs_state[i_d, i_b].qf_bias = self.dofs_state[i_d, i_b].cdof_ang.dot(
-                            self.links_state[i_l, i_b].cfrc_flat_ang
-                        ) + self.dofs_state[i_d, i_b].cdof_vel.dot(self.links_state[i_l, i_b].cfrc_flat_vel)
+                            self.links_state[i_l, i_b].cfrc_ang
+                        ) + self.dofs_state[i_d, i_b].cdof_vel.dot(self.links_state[i_l, i_b].cfrc_vel)
 
                         self.dofs_state[i_d, i_b].force = (
                             self.dofs_state[i_d, i_b].qf_passive
@@ -3190,8 +3050,8 @@ class RigidSolver(Solver):
 
                 for i_d in range(l_info.dof_start, l_info.dof_end):
                     self.dofs_state[i_d, i_b].qf_bias = self.dofs_state[i_d, i_b].cdof_ang.dot(
-                        self.links_state[i_l, i_b].cfrc_flat_ang
-                    ) + self.dofs_state[i_d, i_b].cdof_vel.dot(self.links_state[i_l, i_b].cfrc_flat_vel)
+                        self.links_state[i_l, i_b].cfrc_ang
+                    ) + self.dofs_state[i_d, i_b].cdof_vel.dot(self.links_state[i_l, i_b].cfrc_vel)
 
                     self.dofs_state[i_d, i_b].force = (
                         self.dofs_state[i_d, i_b].qf_passive
@@ -3816,10 +3676,12 @@ class RigidSolver(Solver):
     def _get_qs_idx(self, qs_idx_local=None):
         return self._get_qs_idx_local(qs_idx_local) + self._q_start
 
-    def set_links_pos(self, pos, links_idx=None, envs_idx=None, *, unsafe=False, skip_forward=False):
+    def set_links_pos(self, pos, links_idx=None, envs_idx=None, *, skip_forward=False, unsafe=False):
         raise DeprecationError("This method has been removed. Please use 'set_base_links_pos' instead.")
 
-    def set_base_links_pos(self, pos, links_idx=None, envs_idx=None, *, unsafe=False, skip_forward=False):
+    def set_base_links_pos(
+        self, pos, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False, unsafe=False
+    ):
         if links_idx is None:
             links_idx = self._base_links_idx
         pos, links_idx, envs_idx = self._sanitize_2D_io_variables(
@@ -3829,32 +3691,46 @@ class RigidSolver(Solver):
             pos = pos.unsqueeze(0)
         if not unsafe and not torch.isin(links_idx, self._base_links_idx).all():
             gs.raise_exception("`links_idx` contains at least one link that is not a base link.")
-        self._kernel_set_links_pos(pos, links_idx, envs_idx)
+        self._kernel_set_links_pos(relative, pos, links_idx, envs_idx)
         if not skip_forward:
             self._kernel_forward_kinematics_links_geoms(envs_idx)
 
     @ti.kernel
     def _kernel_set_links_pos(
         self,
+        relative: ti.i32,
         pos: ti.types.ndarray(),
         links_idx: ti.types.ndarray(),
         envs_idx: ti.types.ndarray(),
     ):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i_l_, i_b_ in ti.ndrange(links_idx.shape[0], envs_idx.shape[0]):
+            i_b = envs_idx[i_b_]
             i_l = links_idx[i_l_]
-            I_l = [i_l, i_b_] if ti.static(self._options.batch_links_info) else i_l
-            for i in ti.static(range(3)):
-                self.links_state[i_l, envs_idx[i_b_]].pos[i] = pos[i_b_, i_l_, i]
-            if not (self.links_info[I_l].parent_idx == -1 and self.links_info[I_l].is_fixed):
+            I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
+
+            if self.links_info[I_l].parent_idx == -1 and self.links_info[I_l].is_fixed:
+                for i in ti.static(range(3)):
+                    self.links_state[i_l, i_b].pos[i] = pos[i_b_, i_l_, i]
+                if relative:
+                    for i in ti.static(range(3)):
+                        self.links_state[i_l, i_b].pos[i] = (
+                            self.links_state[i_l, i_b].pos[i] + self.links_info[I_l].pos[i]
+                        )
+            else:
                 q_start = self.links_info[I_l].q_start
                 for i in ti.static(range(3)):
-                    self.qpos[q_start + i, envs_idx[i_b_]] = pos[i_b_, i_l_, i]
+                    self.qpos[q_start + i, i_b] = pos[i_b_, i_l_, i]
+                if relative:
+                    for i in ti.static(range(3)):
+                        self.qpos[q_start + i, i_b] = self.qpos[q_start + i, i_b] + self.qpos0[q_start + i, i_b]
 
-    def set_links_quat(self, quat, links_idx=None, envs_idx=None, *, unsafe=False, skip_forward=False):
+    def set_links_quat(self, quat, links_idx=None, envs_idx=None, *, skip_forward=False, unsafe=False):
         raise DeprecationError("This method has been removed. Please use 'set_base_links_quat' instead.")
 
-    def set_base_links_quat(self, quat, links_idx=None, envs_idx=None, *, unsafe=False, skip_forward=False):
+    def set_base_links_quat(
+        self, quat, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False, unsafe=False
+    ):
         if links_idx is None:
             links_idx = self._base_links_idx
         quat, links_idx, envs_idx = self._sanitize_2D_io_variables(
@@ -3864,27 +3740,58 @@ class RigidSolver(Solver):
             quat = quat.unsqueeze(0)
         if not unsafe and not torch.isin(links_idx, self._base_links_idx).all():
             gs.raise_exception("`links_idx` contains at least one link that is not a base link.")
-        self._kernel_set_links_quat(quat, links_idx, envs_idx)
-        if skip_forward:
+        self._kernel_set_links_quat(relative, quat, links_idx, envs_idx)
+        if not skip_forward:
             self._kernel_forward_kinematics_links_geoms(envs_idx)
 
     @ti.kernel
     def _kernel_set_links_quat(
         self,
+        relative: ti.i32,
         quat: ti.types.ndarray(),
         links_idx: ti.types.ndarray(),
         envs_idx: ti.types.ndarray(),
     ):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i_l_, i_b_ in ti.ndrange(links_idx.shape[0], envs_idx.shape[0]):
+            i_b = envs_idx[i_b_]
             i_l = links_idx[i_l_]
-            I_l = [i_l, i_b_] if ti.static(self._options.batch_links_info) else i_l
-            for i in ti.static(range(4)):
-                self.links_state[i_l, envs_idx[i_b_]].quat[i] = quat[i_b_, i_l_, i]
-            if not (self.links_info[I_l].parent_idx == -1 and self.links_info[I_l].is_fixed):
-                q_start = self.links_info[I_l].q_start
-                for i in ti.static(range(4)):
-                    self.qpos[q_start + i + 3, envs_idx[i_b_]] = quat[i_b_, i_l_, i]
+            I_l = [i_l, i_b] if ti.static(self._options.batch_links_info) else i_l
+
+            if relative:
+                quat_ = ti.Vector(
+                    [
+                        quat[i_b_, i_l_, 0],
+                        quat[i_b_, i_l_, 1],
+                        quat[i_b_, i_l_, 2],
+                        quat[i_b_, i_l_, 3],
+                    ],
+                    dt=gs.ti_float,
+                )
+                if self.links_info[I_l].parent_idx == -1 and self.links_info[I_l].is_fixed:
+                    self.links_state[i_l, i_b].quat = gu.ti_transform_quat_by_quat(self.links_info[I_l].quat, quat_)
+                else:
+                    q_start = self.links_info[I_l].q_start
+                    quat0 = ti.Vector(
+                        [
+                            self.qpos0[q_start + 3, i_b],
+                            self.qpos0[q_start + 4, i_b],
+                            self.qpos0[q_start + 5, i_b],
+                            self.qpos0[q_start + 6, i_b],
+                        ],
+                        dt=gs.ti_float,
+                    )
+                    quat_ = gu.ti_transform_quat_by_quat(quat0, quat_)
+                    for i in ti.static(range(4)):
+                        self.qpos[q_start + i + 3, i_b] = quat_[i]
+            else:
+                if self.links_info[I_l].parent_idx == -1 and self.links_info[I_l].is_fixed:
+                    for i in ti.static(range(4)):
+                        self.links_state[i_l, i_b].quat[i] = quat[i_b_, i_l_, i]
+                else:
+                    q_start = self.links_info[I_l].q_start
+                    for i in ti.static(range(4)):
+                        self.qpos[q_start + i + 3, i_b] = quat[i_b_, i_l_, i]
 
     def set_links_mass_shift(self, mass, links_idx=None, envs_idx=None, *, unsafe=False):
         mass, links_idx, envs_idx = self._sanitize_1D_io_variables(
@@ -3932,8 +3839,8 @@ class RigidSolver(Solver):
             self.n_links,
             envs_idx,
             batched=self._options.batch_links_info,
-            skip_allocation=True,
             idx_name="links_idx",
+            skip_allocation=True,
             unsafe=unsafe,
         )
         if self.n_envs == 0 and self._options.batch_links_info:
@@ -3963,8 +3870,8 @@ class RigidSolver(Solver):
             2,
             envs_idx,
             batched=self._options.batch_links_info,
-            skip_allocation=True,
             idx_name="links_idx",
+            skip_allocation=True,
             unsafe=unsafe,
         )
         if self.n_envs == 0 and self._options.batch_links_info:
@@ -4003,7 +3910,7 @@ class RigidSolver(Solver):
         for i_g_, i_b_ in ti.ndrange(geoms_idx.shape[0], envs_idx.shape[0]):
             self.geoms_state[geoms_idx[i_g_], envs_idx[i_b_]].friction_ratio = friction_ratio[i_b_, i_g_]
 
-    def set_qpos(self, qpos, qs_idx=None, envs_idx=None, *, unsafe=False, skip_forward=False):
+    def set_qpos(self, qpos, qs_idx=None, envs_idx=None, *, skip_forward=False, unsafe=False):
         qpos, qs_idx, envs_idx = self._sanitize_1D_io_variables(
             qpos, qs_idx, self.n_qs, envs_idx, idx_name="qs_idx", skip_allocation=True, unsafe=unsafe
         )
@@ -4015,7 +3922,7 @@ class RigidSolver(Solver):
         if self.constraint_solver is not None:
             self.constraint_solver.reset(envs_idx)
             self.constraint_solver.clear(envs_idx)
-        if skip_forward:
+        if not skip_forward:
             self._kernel_forward_kinematics_links_geoms(envs_idx)
 
     @ti.kernel
@@ -4029,38 +3936,133 @@ class RigidSolver(Solver):
         for i_q_, i_b_ in ti.ndrange(qs_idx.shape[0], envs_idx.shape[0]):
             self.qpos[qs_idx[i_q_], envs_idx[i_b_]] = qpos[i_b_, i_q_]
 
-    def set_global_sol_params(self, sol_params):
+    def set_global_sol_params(self, sol_params, *, unsafe=False):
         """
-        Solver parameters (timeconst, dampratio, dmin, dmax, width, mid, power).
-        Reference: https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
-        """
-        assert len(sol_params) == 7
+        Set constraint solver parameters.
 
-        # Make sure that the constraints parameters are valid
-        sol_params = _sanitize_sol_params(
-            sol_params, self._sol_constraint_min_resolve_time, self._sol_constraint_resolve_time
-        )
+        Reference: https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
+
+        Parameters
+        ----------
+        sol_params: Tuple[float] | List[float] | np.ndarray | torch.tensor
+            array of length 7 in which each element corresponds to
+            (timeconst, dampratio, dmin, dmax, width, mid, power)
+        """
+        # Sanitize input arguments
+        if not unsafe:
+            _sol_params = torch.as_tensor(sol_params, dtype=gs.tc_float, device=gs.device).contiguous()
+            if _sol_params is not sol_params:
+                gs.logger.debug(ALLOCATE_TENSOR_WARNING)
+            sol_params = _sol_params
+
+        # Make sure that the constraints parameters are within range
+        _sanitize_sol_params(sol_params, self._sol_min_timeconst)
 
         self._kernel_set_global_sol_params(sol_params)
 
     @ti.kernel
     def _kernel_set_global_sol_params(self, sol_params: ti.types.ndarray()):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
-        for i in range(self.n_geoms):
-            for j in ti.static(range(7)):
-                self.geoms_info[i].sol_params[j] = sol_params[j]
+        for i_g in range(self.n_geoms):
+            for i in ti.static(range(7)):
+                self.geoms_info[i_g].sol_params[i] = sol_params[i]
 
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
-        for i, b in ti.ndrange(self.n_joints, self._B):
-            I = [i, b] if ti.static(self._options.batch_joints_info) else i
-            for j in ti.static(range(7)):
-                self.joints_info[I].sol_params[j] = sol_params[j]
+        for i_j, i_b in ti.ndrange(self.n_joints, self._B):
+            I_j = [i_j, i_b] if ti.static(self._options.batch_joints_info) else i_j
+            for i in ti.static(range(7)):
+                self.joints_info[I_j].sol_params[i] = sol_params[i]
 
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
-        for i, b in ti.ndrange(self.n_dofs, self._B):
-            I = [i, b] if ti.static(self._options.batch_dofs_info) else i
-            for j in ti.static(range(7)):
-                self.dofs_info[I].sol_params[j] = sol_params[j]
+        for i_eq in range(self.n_equalities):
+            for i in ti.static(range(7)):
+                self.equalities_info[i_eq].sol_params[i] = sol_params[i]
+
+    def set_sol_params(self, sol_params, geoms_idx=None, envs_idx=None, *, joints_idx=None, eqs_idx=None, unsafe=False):
+        """
+        Set constraint solver parameters.
+
+        Reference: https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
+
+        Parameters
+        ----------
+        sol_params: Tuple[float] | List[float] | np.ndarray | torch.tensor
+            array of length 7 in which each element corresponds to
+            (timeconst, dampratio, dmin, dmax, width, mid, power)
+        """
+        # Make sure that a single constraint type has been selected at once
+        if sum(inputs_idx is not None for inputs_idx in (geoms_idx, joints_idx, eqs_idx)) > 1:
+            raise gs.raise_exception("Cannot set more than one constraint type at once.")
+
+        # Select the right input type
+        if eqs_idx is not None:
+            constraint_type = 2
+            idx_name = "eqs_idx"
+            inputs_idx = eqs_idx
+            inputs_length = self.n_equalities
+            batched = True
+        elif joints_idx is not None:
+            constraint_type = 1
+            idx_name = "joints_idx"
+            inputs_idx = joints_idx
+            inputs_length = self.n_joints
+            batched = self._options.batch_joints_info
+        else:
+            constraint_type = 0
+            idx_name = "geoms_idx"
+            inputs_idx = geoms_idx
+            inputs_length = self.n_geoms
+            batched = False
+
+        # Sanitize input arguments
+        sol_params_, inputs_idx, envs_idx = self._sanitize_2D_io_variables(
+            sol_params,
+            inputs_idx,
+            inputs_length,
+            7,
+            envs_idx,
+            batched=batched,
+            idx_name=idx_name,
+            skip_allocation=True,
+            unsafe=unsafe,
+        )
+
+        # Make sure that the constraints parameters are within range
+        sol_params = sol_params_.clone() if sol_params_ is sol_params else sol_params_
+        _sanitize_sol_params(sol_params, self._sol_min_timeconst)
+
+        if batched and self.n_envs == 0:
+            sol_params = sol_params.unsqueeze(0)
+        self._kernel_set_sol_params(constraint_type, sol_params, inputs_idx, envs_idx)
+
+    @ti.kernel
+    def _kernel_set_sol_params(
+        self,
+        constraint_type: ti.template(),
+        sol_params: ti.types.ndarray(),
+        inputs_idx: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+    ):
+        if ti.static(constraint_type == 0):  # geometries
+            ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
+            for i_g_ in range(inputs_idx.shape[0]):
+                for i in ti.static(range(7)):
+                    self.geoms_info[inputs_idx[i_g_]].sol_params[i] = sol_params[i_g_, i]
+        elif ti.static(constraint_type == 1):  # joints
+            ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
+            if ti.static(self._options.batch_joints_info):
+                for i_j_, i_b_ in ti.ndrange(inputs_idx.shape[0], envs_idx.shape[0]):
+                    for i in ti.static(range(7)):
+                        self.joints_info[inputs_idx[i_j_], envs_idx[i_b_]].sol_params[i] = sol_params[i_b_, i_j_, i]
+            else:
+                for i_j_ in range(inputs_idx.shape[0]):
+                    for i in ti.static(range(7)):
+                        self.joints_info[inputs_idx[i_j_]].sol_params[i] = sol_params[i_j_, i]
+        else:  # equalities
+            ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
+            for i_eq_, i_b_ in ti.ndrange(inputs_idx.shape[0], envs_idx.shape[0]):
+                for i in ti.static(range(7)):
+                    self.equalities_info[inputs_idx[i_eq_], envs_idx[i_b_]].sol_params[i] = sol_params[i_b_, i_eq_, i]
 
     def _set_dofs_info(self, tensor_list, dofs_idx, name, envs_idx=None, *, unsafe=False):
         tensor_list = list(tensor_list)
@@ -4243,7 +4245,7 @@ class RigidSolver(Solver):
                 self.dofs_info[dofs_idx[i_d_]].limit[0] = lower[i_d_]
                 self.dofs_info[dofs_idx[i_d_]].limit[1] = upper[i_d_]
 
-    def set_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None, *, unsafe=False, skip_forward=False):
+    def set_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None, *, skip_forward=False, unsafe=False):
         velocity, dofs_idx, envs_idx = self._sanitize_1D_io_variables(
             velocity, dofs_idx, self.n_dofs, envs_idx, skip_allocation=True, unsafe=unsafe
         )
@@ -4279,7 +4281,7 @@ class RigidSolver(Solver):
         for i_d_, i_b_ in ti.ndrange(dofs_idx.shape[0], envs_idx.shape[0]):
             self.dofs_state[dofs_idx[i_d_], envs_idx[i_b_]].vel = 0.0
 
-    def set_dofs_position(self, position, dofs_idx=None, envs_idx=None, *, unsafe=False, skip_forward=False):
+    def set_dofs_position(self, position, dofs_idx=None, envs_idx=None, *, skip_forward=False, unsafe=False):
         position, dofs_idx, envs_idx = self._sanitize_1D_io_variables(
             position, dofs_idx, self.n_dofs, envs_idx, skip_allocation=True, unsafe=unsafe
         )
@@ -4291,7 +4293,7 @@ class RigidSolver(Solver):
         if self.constraint_solver is not None:
             self.constraint_solver.reset(envs_idx)
             self.constraint_solver.clear(envs_idx)
-        if skip_forward:
+        if not skip_forward:
             self._kernel_forward_kinematics_links_geoms(envs_idx)
 
     @ti.kernel
@@ -4415,6 +4417,26 @@ class RigidSolver(Solver):
             self.dofs_state[dofs_idx[i_d_], envs_idx[i_b_]].ctrl_mode = gs.CTRL_MODE.POSITION
             self.dofs_state[dofs_idx[i_d_], envs_idx[i_b_]].ctrl_pos = position[i_b_, i_d_]
 
+    def get_sol_params(self, geoms_idx=None, envs_idx=None, *, joints_idx=None, eqs_idx=None, unsafe=False):
+        """
+        Get constraint solver parameters.
+        """
+        if eqs_idx is not None:
+            if not unsafe:
+                assert envs_idx is None
+            tensor = ti_field_to_torch(self.equalities_info.sol_params, None, eqs_idx, transpose=True, unsafe=unsafe)
+            if self.n_envs == 0:
+                tensor = tensor.squeeze(0)
+        elif joints_idx is not None:
+            tensor = ti_field_to_torch(self.joints_info.sol_params, envs_idx, joints_idx, transpose=True, unsafe=unsafe)
+            if self.n_envs == 0 and self._options.batch_joints_info:
+                tensor = tensor.squeeze(0)
+        else:
+            if not unsafe:
+                assert envs_idx is None
+            tensor = ti_field_to_torch(self.geoms_info.sol_params, geoms_idx, transpose=True, unsafe=unsafe)
+        return tensor
+
     def get_links_pos(self, links_idx=None, envs_idx=None, *, unsafe=False):
         tensor = ti_field_to_torch(self.links_state.pos, envs_idx, links_idx, transpose=True, unsafe=unsafe)
         return tensor.squeeze(0) if self.n_envs == 0 else tensor
@@ -4454,42 +4476,38 @@ class RigidSolver(Solver):
         envs_idx: ti.types.ndarray(),
         ref: ti.template(),
     ):
-        # This is the velocity in world coordinates expressed at global com-position.
-        # Must translate to get the velocity expressed at link-position, which is usually
-        # expected by the user and arguably the only quantity that is meaningful for the user.
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i_l_, i_b_ in ti.ndrange(links_idx.shape[0], envs_idx.shape[0]):
             l_state = self.links_state[links_idx[i_l_], envs_idx[i_b_]]
-            xvel = l_state.vel  # entity's CoM
+
+            # This is the velocity in world coordinates expressed at global com-position
+            vel = l_state.cd_vel  # entity's CoM
+
+            # Translate to get the velocity expressed at a different position if necessary link-position
             if ti.static(ref == 1):  # link's CoM
-                xvel = xvel + l_state.ang.cross(l_state.i_pos)
+                vel = vel + l_state.cd_ang.cross(l_state.i_pos)
             if ti.static(ref == 2):  # link's origin
-                xvel = xvel + l_state.ang.cross(l_state.pos - l_state.COM)
+                vel = vel + l_state.cd_ang.cross(l_state.pos - l_state.COM)
+
             for i in ti.static(range(3)):
-                tensor[i_b_, i_l_, i] = xvel[i]
+                tensor[i_b_, i_l_, i] = vel[i]
 
     def get_links_ang(self, links_idx=None, envs_idx=None, *, unsafe=False):
-        tensor = ti_field_to_torch(self.links_state.ang, envs_idx, links_idx, transpose=True, unsafe=unsafe)
+        tensor = ti_field_to_torch(self.links_state.cd_ang, envs_idx, links_idx, transpose=True, unsafe=unsafe)
         return tensor.squeeze(0) if self.n_envs == 0 else tensor
 
-    @ti.kernel
-    def _kernel_inverse_dynamics_for_sensors(self):
-        self._func_system_update_acc(True)
-        self._func_system_update_force()
-        self._func_inverse_link_force()
-
-    def get_links_acc(self, links_idx=None, envs_idx=None, *, unsafe=False):
+    def get_links_acc(self, links_idx=None, envs_idx=None, *, mimick_imu=False, unsafe=False):
         _tensor, links_idx, envs_idx = self._sanitize_2D_io_variables(
             None, links_idx, self.n_links, 3, envs_idx, idx_name="links_idx", unsafe=unsafe
         )
-        self._kernel_inverse_dynamics_for_sensors()
         tensor = _tensor.unsqueeze(0) if self.n_envs == 0 else _tensor
-        self._kernel_get_links_acc(tensor, links_idx, envs_idx)
+        self._kernel_get_links_acc(mimick_imu, tensor, links_idx, envs_idx)
         return _tensor
 
     @ti.kernel
     def _kernel_get_links_acc(
         self,
+        mimick_imu: ti.i32,
         tensor: ti.types.ndarray(),
         links_idx: ti.types.ndarray(),
         envs_idx: ti.types.ndarray(),
@@ -4499,23 +4517,30 @@ class RigidSolver(Solver):
             i_l = links_idx[i_l_]
             i_b = envs_idx[i_b_]
 
-            quat = gu.ti_inv_quat(self.links_state[i_l, i_b].j_quat)
-            dpos = self.links_state[i_l, i_b].pos - self.links_state[i_l, i_b].COM
-            acc = gu.ti_transform_by_quat(  # gravitational component is included in cdd_vel already
-                self.links_state[i_l, i_b].cdd_vel - dpos.cross(self.links_state[i_l, i_b].cdd_ang),
-                quat,
-            )
-            ang = gu.ti_transform_by_quat(self.links_state[i_l, i_b].cd_ang, quat)
-            lin = gu.ti_transform_by_quat(
-                self.links_state[i_l, i_b].cd_vel - dpos.cross(self.links_state[i_l, i_b].cd_ang),
-                quat,
-            )
-            correction = ang.cross(lin)  # centrifugal
-            final_acc = acc + correction
+            # Compute links spatial acceleration expressed at links origin in world coordinates
+            cpos = self.links_state[i_l, i_b].pos - self.links_state[i_l, i_b].COM
+            acc_ang = self.links_state[i_l, i_b].cacc_ang
+            acc_lin = self.links_state[i_l, i_b].cacc_lin + acc_ang.cross(cpos)
 
-            final_acc = self.links_state[i_l, i_b].cdd_vel
+            # Compute links classical linear acceleration expressed at links origin in world coordinates
+            ang = self.links_state[i_l, i_b].cd_ang
+            vel = self.links_state[i_l, i_b].cd_vel + ang.cross(cpos)
+            acc_classic_lin = acc_lin + ang.cross(vel)
+
+            # Mimick IMU accelerometer signal if requested
+            if mimick_imu:
+                # Subtract gravity
+                acc_classic_lin -= self._gravity[None]
+
+                # Move the resulting linear acceleration in local links frame
+                acc_classic_lin = gu.ti_inv_transform_by_quat(acc_classic_lin, self.links_state[i_l, i_b].quat)
+
             for i in range(3):
-                tensor[i_b_, i_l_, i] = final_acc[i]
+                tensor[i_b_, i_l_, i] = acc_classic_lin[i]
+
+    def get_links_acc_ang(self, links_idx=None, envs_idx=None, *, unsafe=False):
+        tensor = ti_field_to_torch(self.links_state.cacc_ang, envs_idx, links_idx, transpose=True, unsafe=unsafe)
+        return tensor.squeeze(0) if self.n_envs == 0 else tensor
 
     def get_links_COM(self, links_idx=None, envs_idx=None, *, unsafe=False):
         tensor = ti_field_to_torch(self.links_state.COM, envs_idx, links_idx, transpose=True, unsafe=unsafe)
@@ -4654,6 +4679,29 @@ class RigidSolver(Solver):
         tensor = ti_field_to_torch(self.dofs_info.damping, envs_idx, dofs_idx, transpose=True, unsafe=unsafe)
         return tensor.squeeze(0) if self.n_envs == 0 and self._options.batch_dofs_info else tensor
 
+    def get_mass_mat(self, dofs_idx=None, envs_idx=None, decompose=False, *, unsafe=False):
+        tensor = ti_field_to_torch(
+            self.mass_mat_L if decompose else self.mass_mat, envs_idx, transpose=True, unsafe=unsafe
+        )
+
+        if dofs_idx is not None:
+            if isinstance(dofs_idx, (slice, int)) or (dofs_idx.ndim == 0):
+                tensor = tensor[:, dofs_idx, dofs_idx]
+                if tensor.ndim == 1:
+                    tensor = tensor.reshape((-1, 1, 1))
+            else:
+                tensor = tensor[:, dofs_idx.unsqueeze(1), dofs_idx]
+        if self.n_envs == 0:
+            tensor = tensor.squeeze(0)
+
+        if decompose:
+            mass_mat_D_inv = ti_field_to_torch(self.mass_mat_D_inv, envs_idx, dofs_idx, transpose=True, unsafe=unsafe)
+            if self.n_envs == 0:
+                mass_mat_D_inv = mass_mat_D_inv.squeeze(0)
+            return tensor, mass_mat_D_inv
+
+        return tensor
+
     @ti.kernel
     def _kernel_set_drone_rpm(
         self,
@@ -4773,23 +4821,23 @@ class RigidSolver(Solver):
                 shared_pos, self.links_state[l2, i_b].pos, self.links_state[l2, i_b].quat
             )
 
-            self.equality_info[i_e, i_b].eq_type = gs.ti_int(gs.EQUALITY_TYPE.WELD)
-            self.equality_info[i_e, i_b].eq_obj1id = l1
-            self.equality_info[i_e, i_b].eq_obj2id = l2
+            self.equalities_info[i_e, i_b].eq_type = gs.ti_int(gs.EQUALITY_TYPE.WELD)
+            self.equalities_info[i_e, i_b].eq_obj1id = l1
+            self.equalities_info[i_e, i_b].eq_obj2id = l2
 
             for i_3 in range(3):
-                self.equality_info[i_e, i_b].eq_data[i_3 + 3] = pos1[i_3]
-                self.equality_info[i_e, i_b].eq_data[i_3] = pos2[i_3]
+                self.equalities_info[i_e, i_b].eq_data[i_3 + 3] = pos1[i_3]
+                self.equalities_info[i_e, i_b].eq_data[i_3] = pos2[i_3]
 
             relpose = gu.ti_quat_mul(gu.ti_inv_quat(self.links_state[l1, i_b].quat), self.links_state[l2, i_b].quat)
 
-            self.equality_info[i_e, i_b].eq_data[6] = relpose[0]
-            self.equality_info[i_e, i_b].eq_data[7] = relpose[1]
-            self.equality_info[i_e, i_b].eq_data[8] = relpose[2]
-            self.equality_info[i_e, i_b].eq_data[9] = relpose[3]
+            self.equalities_info[i_e, i_b].eq_data[6] = relpose[0]
+            self.equalities_info[i_e, i_b].eq_data[7] = relpose[1]
+            self.equalities_info[i_e, i_b].eq_data[8] = relpose[2]
+            self.equalities_info[i_e, i_b].eq_data[9] = relpose[3]
 
-            self.equality_info[i_e, i_b].eq_data[10] = 1.0
-            self.equality_info[i_e, i_b].sol_params = ti.Vector(
+            self.equalities_info[i_e, i_b].eq_data[10] = 1.0
+            self.equalities_info[i_e, i_b].sol_params = ti.Vector(
                 [2 * self._substep_dt, 1.0e00, 9.0e-01, 9.5e-01, 1.0e-03, 5.0e-01, 2.0e00]
             )
 
@@ -4816,12 +4864,12 @@ class RigidSolver(Solver):
             i_b = envs_idx[i_b_]
             for i_e in range(self.n_equalities, self.constraint_solver.ti_n_equalities[i_b]):
                 if (
-                    self.equality_info[i_e, i_b].eq_type == gs.EQUALITY_TYPE.WELD
-                    and self.equality_info[i_e, i_b].eq_obj1id == link1_idx[i_b]
-                    and self.equality_info[i_e, i_b].eq_obj2id == link2_idx[i_b]
+                    self.equalities_info[i_e, i_b].eq_type == gs.EQUALITY_TYPE.WELD
+                    and self.equalities_info[i_e, i_b].eq_obj1id == link1_idx[i_b]
+                    and self.equalities_info[i_e, i_b].eq_obj2id == link2_idx[i_b]
                 ):
                     if i_e < self.constraint_solver.ti_n_equalities[i_b] - 1:
-                        self.equality_info[i_e, i_b] = self.equality_info[
+                        self.equalities_info[i_e, i_b] = self.equalities_info[
                             self.constraint_solver.ti_n_equalities[i_b] - 1, i_b
                         ]
                     self.constraint_solver.ti_n_equalities[i_b] = self.constraint_solver.ti_n_equalities[i_b] - 1

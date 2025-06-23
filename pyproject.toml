@@ -13,7 +13,7 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "psutil",
     "taichi >= 1.7.2",
-    "pydantic == 2.7.1",
+    "pydantic >= 2.7.1",
     "numpy >= 1.26.4",
     "trimesh",
     "scipy >= 1.14",
@@ -101,8 +101,12 @@ filterwarnings = [
 ]
 markers = [
     "benchmarks: marks benchmarks (executed independently and sequentially).",
+    "required: marks minimal test set that must pass systematically on any environment before merging.",
 ]
 log_cli_level = "WARNING"
+retries = 4
+retry_delay = 30
+cumulative_timing = true
 
 [project.scripts]
 gs = "genesis._main:main"
@@ -114,7 +118,10 @@ dev = [
     "pytest-xdist",
     "pytest-forked",
     "pytest-random-order",
+    "pytest-print",
+    "pytest-retry",
     "huggingface_hub",
+    "wandb",
 ]
 docs = [
     # Note that currently sphinx 7 does not work, so we must use v6.2.1. See https://github.com/kivy/kivy/issues/8230 which tracks this issue. Once fixed we can use a later version

@@ -6,64 +6,9 @@
 # Create a struct to store the arguments
 import argparse
 from batch_benchmark import BenchmarkArgs
+benchmark_args = BenchmarkArgs.parse_benchmark_args()
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-r", "--rasterizer", action="store_true", default=False)
-    parser.add_argument("-n", "--n_envs", type=int, default=1024)
-    parser.add_argument("-s", "--n_steps", type=int, default=1)
-    parser.add_argument("-x", "--resX", type=int, default=1024)
-    parser.add_argument("-y", "--resY", type=int, default=1024)
-    parser.add_argument("-i", "--camera_posX", type=float, default=1.5)
-    parser.add_argument("-j", "--camera_posY", type=float, default=0.5)
-    parser.add_argument("-k", "--camera_posZ", type=float, default=1.5)
-    parser.add_argument("-l", "--camera_lookatX", type=float, default=0.0)
-    parser.add_argument("-m", "--camera_lookatY", type=float, default=0.0)
-    parser.add_argument("-o", "--camera_lookatZ", type=float, default=0.5)
-    parser.add_argument("-v", "--camera_fov", type=float, default=45)
-    parser.add_argument("-f", "--mjcf", type=str, default="xml/franka_emika_panda/panda.xml")
-    parser.add_argument("-g", "--benchmark_result_file_path", type=str, default="benchmark.csv")
-    parser.add_argument("--max_bounce", type=int, default=4)
-    parser.add_argument("--spp", type=int, default=64)
-    parser.add_argument("--gui", action="store_true", default=False)
-    
-    args = parser.parse_args()
-    benchmark_args = BenchmarkArgs(
-        rasterizer=args.rasterizer,
-        n_envs=args.n_envs,
-        n_steps=args.n_steps,
-        resX=args.resX,
-        resY=args.resY,
-        camera_posX=args.camera_posX,
-        camera_posY=args.camera_posY,
-        camera_posZ=args.camera_posZ,
-        camera_lookatX=args.camera_lookatX,
-        camera_lookatY=args.camera_lookatY,
-        camera_lookatZ=args.camera_lookatZ,
-        camera_fov=args.camera_fov,
-        mjcf=args.mjcf,
-        benchmark_result_file_path=args.benchmark_result_file_path,
-        max_bounce=args.max_bounce,
-        spp=args.spp,
-        gui=args.gui,
-    )
-    print(f"Benchmark with args:")
-    print(f"  rasterizer: {benchmark_args.rasterizer}")
-    print(f"  n_envs: {benchmark_args.n_envs}")
-    print(f"  n_steps: {benchmark_args.n_steps}")
-    print(f"  resolution: {benchmark_args.resX}x{benchmark_args.resY}")
-    print(f"  camera_pos: ({benchmark_args.camera_posX}, {benchmark_args.camera_posY}, {benchmark_args.camera_posZ})")
-    print(f"  camera_lookat: ({benchmark_args.camera_lookatX}, {benchmark_args.camera_lookatY}, {benchmark_args.camera_lookatZ})")
-    print(f"  camera_fov: {benchmark_args.camera_fov}")
-    print(f"  mjcf: {benchmark_args.mjcf}")
-    print(f"  benchmark_result_file_path: {benchmark_args.benchmark_result_file_path}")
-    print(f"  max_bounce: {benchmark_args.max_bounce}")
-    print(f"  spp: {benchmark_args.spp}")
-    return benchmark_args
-
-benchmark_args = parse_args()
-
-# Launch app
+######################## Launch app #######################
 from isaaclab.app import AppLauncher
 app = AppLauncher(
     headless=not benchmark_args.gui,
@@ -72,23 +17,10 @@ app = AppLauncher(
     rendering_mode="performance",
 ).app
 
-import os
-import math
-import numpy as np
-import torch
-from PIL import Image
-import psutil
-import pynvml
-from scipy.spatial.transform import Rotation as R
-
 import carb
 import isaaclab.sim as sim_utils
 import isaacsim.core.utils.prims as prim_utils
 import isaacsim.core.utils.stage as stage_utils
-from isaaclab.assets import (
-    RigidObject, RigidObjectCfg,
-    Articulation, ArticulationCfg,
-)
 from isaaclab.sensors.camera import TiledCamera, TiledCameraCfg
 from isaaclab.sim.converters import (
     MjcfConverter, MjcfConverterCfg,
@@ -99,13 +31,22 @@ from isaaclab.utils.math import (
     quat_from_matrix,
 )
 import omni.replicator.core as rep
-from pxr import UsdLux, Gf, PhysxSchema
+from pxr import UsdLux, PhysxSchema
 
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.asset.importer.mjcf")
-import isaacsim.asset.importer.mjcf
 
-shadow = False
+import os
+import math
+import numpy as np
+import torch
+import psutil
+import pynvml
+from scipy.spatial.transform import Rotation as R
+from genesis.utils.image_exporter import FrameImageExporter
+import benchmark_utils
+from benchmark_profiler import BenchmarkProfiler
+
 
 def load_mjcf(mjcf_path):
     return MjcfConverter(
@@ -125,6 +66,86 @@ def load_urdf(urdf_path):
             force_usd_conversion=True
         )
     ).usd_path
+
+def apply_benchmark_carb_settings(print_changes=False):
+    settings = carb.settings.get_settings()
+    # Print settings before applying the settings
+    if print_changes:
+        print("Before settings:")
+        print("Render mode:", settings.get("/rtx/rendermode"))
+        print("Sample per pixel:", settings.get("/rtx/pathtracing/spp"))
+        print("Total spp:", settings.get("/rtx/pathtracing/totalSpp"))
+        print("Clamp spp:", settings.get("/rtx/pathtracing/clampSpp"))
+        print("Max bounce:", settings.get("/rtx/pathtracing/maxBounces"))
+        print("Optix Denoiser", settings.get("/rtx/pathtracing/optixDenoiser/enabled"))
+        print("Shadows", settings.get("/rtx/shadows/enabled"))
+        print("dlss/enabled:", settings.get("/rtx/post/dlss/enabled"))
+        print("dlss/auto:", settings.get("/rtx/post/dlss/auto"))
+        print("upscaling/enabled:", settings.get("/rtx/post/upscaling/enabled"))
+        print("aa/denoiser/enabled:", settings.get("/rtx/post/aa/denoiser/enabled"))
+        print("aa/taa/enabled:", settings.get("/rtx/post/aa/taa/enabled"))
+        print("motionBlur/enabled:", settings.get("/rtx/post/motionBlur/enabled"))
+        print("dof/enabled:", settings.get("/rtx/post/dof/enabled"))
+        print("bloom/enabled:", settings.get("/rtx/post/bloom/enabled"))
+        print("tonemap/enabled:", settings.get("/rtx/post/tonemap/enabled"))
+        print("exposure/enabled:", settings.get("/rtx/post/exposure/enabled"))
+        print("vsync:", settings.get("/app/window/vsync"))
+
+    # Options: https://docs.omniverse.nvidia.com/materials-and-rendering/latest/rtx-renderer_pt.html
+    if benchmark_args.rasterizer:
+        # carb_settings.set("/rtx/rendermode", "Hydra Storm")
+        settings.set("/rtx/rendermode", "RayTracedLighting")
+    else:
+        settings.set("/rtx/rendermode", "PathTracing")
+    settings.set("/rtx/shadows/enabled", False)
+
+    # Path tracing settings
+    settings.set("/rtx/pathtracing/spp", benchmark_args.spp)
+    settings.set("/rtx/pathtracing/totalSpp", benchmark_args.spp)
+    settings.set("/rtx/pathtracing/clampSpp", benchmark_args.spp)
+    settings.set("/rtx/pathtracing/maxBounces", benchmark_args.max_bounce)
+    settings.set("/rtx/pathtracing/optixDenoiser/enabled", False)
+    settings.set("/rtx/pathtracing/adaptiveSampling/enabled", False)
+
+    # Disable DLSS & upscaling
+    settings.set("/rtx-transient/dlssg/enabled", False)
+    settings.set("/rtx/post/dlss/enabled", False)
+    settings.set("/rtx/post/dlss/auto", False)
+    settings.set("/rtx/post/upscaling/enabled", False)
+
+    # Disable post-processing
+    settings.set("/rtx/post/aa/denoiser/enabled", False)
+    settings.set("/rtx/post/aa/taa/enabled", False)
+    settings.set("/rtx/post/motionBlur/enabled", False)
+    settings.set("/rtx/post/dof/enabled", False)
+    settings.set("/rtx/post/bloom/enabled", False)
+    settings.set("/rtx/post/tonemap/enabled", False)
+    settings.set("/rtx/post/exposure/enabled", False)
+
+    # Disable VSync
+    settings.set("/app/window/vsync", False)
+
+    # Print settings after applying the settings
+    if print_changes:
+        print("After settings:")
+        print("Render mode:", settings.get("/rtx/rendermode"))
+        print("Sample per pixel:", settings.get("/rtx/pathtracing/spp"))
+        print("Total spp:", settings.get("/rtx/pathtracing/totalSpp"))
+        print("Clamp spp:", settings.get("/rtx/pathtracing/clampSpp"))
+        print("Max bounce:", settings.get("/rtx/pathtracing/maxBounces"))
+        print("Optix Denoiser", settings.get("/rtx/pathtracing/optixDenoiser/enabled"))
+        print("Shadows", settings.get("/rtx/shadows/enabled"))
+        print("dlss/enabled:", settings.get("/rtx/post/dlss/enabled"))
+        print("dlss/auto:", settings.get("/rtx/post/dlss/auto"))
+        print("upscaling/enabled:", settings.get("/rtx/post/upscaling/enabled"))
+        print("aa/denoiser/enabled:", settings.get("/rtx/post/aa/denoiser/enabled"))
+        print("aa/taa/enabled:", settings.get("/rtx/post/aa/taa/enabled"))
+        print("motionBlur/enabled:", settings.get("/rtx/post/motionBlur/enabled"))
+        print("dof/enabled:", settings.get("/rtx/post/dof/enabled"))
+        print("bloom/enabled:", settings.get("/rtx/post/bloom/enabled"))
+        print("tonemap/enabled:", settings.get("/rtx/post/tonemap/enabled"))
+        print("exposure/enabled:", settings.get("/rtx/post/exposure/enabled"))
+        print("vsync:", settings.get("/app/window/vsync"))
 
 def init_isaac(benchmark_args):
     ########################## init ##########################
@@ -146,7 +167,6 @@ def init_isaac(benchmark_args):
     scene.set_camera_view(eye=cam_eye, target=cam_target)
     cam_eye = torch.Tensor(cam_eye).reshape(-1, 3)
     cam_target = torch.Tensor(cam_target).reshape(-1, 3)
-    carb_settings = carb.settings.get_settings()
 
     physxSceneAPI = PhysxSchema.PhysxSceneAPI.Apply(stage.GetPrimAtPath("/physicsScene"))
     physxSceneAPI.CreateGpuTempBufferCapacityAttr(16 * 1024 * 1024 * 2)
@@ -154,37 +174,8 @@ def init_isaac(benchmark_args):
     physxSceneAPI.CreateGpuMaxRigidPatchCountAttr(8388608)
     physxSceneAPI.CreateGpuMaxRigidContactCountAttr(16777216)
 
-    # Options: https://docs.omniverse.nvidia.com/materials-and-rendering/latest/rtx-renderer_pt.html
-    print("Before setting:")
-    print("Render mode:", carb_settings.get("/rtx/rendermode"))
-    print("Sample per pixel:", carb_settings.get("/rtx/pathtracing/spp"))
-    print("Total spp:", carb_settings.get("/rtx/pathtracing/totalSpp"))
-    print("Clamp spp:", carb_settings.get("/rtx/pathtracing/clampSpp"))
-    print("Max bounce:", carb_settings.get("/rtx/pathtracing/maxBounces"))
-    print("Optix Denoiser", carb_settings.get("/rtx/pathtracing/optixDenoiser/enabled"))
-    print("Shadows", carb_settings.get("/rtx/shadows/enabled"))
-
     rep.settings.set_render_rtx_realtime()
-    if benchmark_args.rasterizer:
-        # carb_settings.set("/rtx/rendermode", "Hydra Storm")
-        carb_settings.set("/rtx/rendermode", "RayTracedLighting")
-    else:
-        carb_settings.set("/rtx/rendermode", "PathTracing")
-    carb_settings.set("/rtx/pathtracing/spp", benchmark_args.spp)
-    carb_settings.set("/rtx/pathtracing/totalSpp", benchmark_args.spp)
-    carb_settings.set("/rtx/pathtracing/clampSpp", benchmark_args.spp)
-    carb_settings.set("/rtx/pathtracing/maxBounces", benchmark_args.max_bounce)
-    carb_settings.set("/rtx/pathtracing/optixDenoiser/enabled", False)
-    carb_settings.set("/rtx/shadows/enabled", shadow)
-
-    print("After setting:")
-    print("Render mode:", carb_settings.get("/rtx/rendermode"))
-    print("Sample per pixel:", carb_settings.get("/rtx/pathtracing/spp"))
-    print("Total spp:", carb_settings.get("/rtx/pathtracing/totalSpp"))
-    print("Clamp spp:", carb_settings.get("/rtx/pathtracing/clampSpp"))
-    print("Max bounce:", carb_settings.get("/rtx/pathtracing/maxBounces"))
-    print("Optix Denoiser", carb_settings.get("/rtx/pathtracing/optixDenoiser/enabled"))
-    print("Shadows", carb_settings.get("/rtx/shadows/enabled"))
+    apply_benchmark_carb_settings()
 
     ########################## entities ##########################
     spacing_row = np.array((2.0, -6.0))
@@ -203,7 +194,6 @@ def init_isaac(benchmark_args):
     offsets = np.array(offsets)
 
     # load objects
-    # plane_path = load_urdf(os.path.join("genesis/assets", "urdf/plane/plane.urdf"))
     plane_path = os.path.abspath(os.path.join("genesis/assets", "urdf/plane_usd/plane.usd"))
     print(plane_path)
     plane_cfg = sim_utils.UsdFileCfg(usd_path=plane_path)
@@ -214,14 +204,6 @@ def init_isaac(benchmark_args):
     print("Robot asset:", robot_path)
     robot_cfg = sim_utils.UsdFileCfg(usd_path=robot_path)
     robot_cfg.func("/World/Origin.*/robot", robot_cfg)
-    # robot = Articulation(
-    #     cfg = ArticulationCfg(
-    #         prim_path="/World/Origin.*/robot",
-    #         actuators={},))
-    # for i in range(benchmark_args.n_envs):
-    #     stage.RemovePrim(f"/World/Origin{i:05d}/robot/worldBody")
-    # print(stage.GetPrimAtPath("World/Origin00000/robot/worldBody"))
-    # print(stage.GetPrimAtPath("World/Origin00001/robot/worldBody"))
 
     cam_fov = math.radians(benchmark_args.camera_fov)
     cam_hapert = 20.955
@@ -233,8 +215,6 @@ def init_isaac(benchmark_args):
     )
     cam_eye = tuple(cam_eye.detach().cpu().squeeze().numpy())
     cam_quat = tuple(cam_quat.detach().cpu().squeeze().numpy())
-    # cam_quat = (-cam_quat[3], cam_quat[2], -cam_quat[1], cam_quat[0])
-    # cam_quat = (-cam_quat[0], -cam_quat[1], -cam_quat[2], -cam_quat[3])
 
     print(cam_eye, cam_quat)
     print(type(cam_eye), type(cam_quat))
@@ -291,14 +271,6 @@ def init_isaac(benchmark_args):
 
     return scene, cam_0
 
-def add_noise_to_all_cameras(scene):
-    for cam in scene.visualizer.cameras:
-        cam.set_pose(
-            pos=cam.pos_all_envs + torch.rand((cam.n_envs, 3), device=cam.pos_all_envs.device) * 0.002 - 0.001,
-            lookat=cam.lookat_all_envs + torch.rand((cam.n_envs, 3), device=cam.lookat_all_envs.device) * 0.002 - 0.001,
-            up=cam.up_all_envs + torch.rand((cam.n_envs, 3), device=cam.up_all_envs.device) * 0.002 - 0.001,
-        )
-
 def get_utilization_percentages(reset: bool = False, max_values: list[float] = [0.0, 0.0, 0.0, 0.0]) -> list[float]:
     """Get the maximum CPU, RAM, GPU utilization (processing), and
     GPU memory usage percentages since the last time reset was true."""
@@ -342,11 +314,6 @@ def fill_gpu_cache_with_random_data():
     # 100 MB of random data
     dummy_data = torch.rand(100, 1024, 1024, device="cuda")
     # Make some random data manipulation to the entire tensor
-    dummy_data = dummy_data + 1
-    dummy_data = dummy_data * 2
-    dummy_data = dummy_data - 1
-    dummy_data = dummy_data / 2
-    dummy_data = dummy_data.abs()
     dummy_data = dummy_data.sqrt()
 
 def run_benchmark(scene, camera, benchmark_args):
@@ -360,7 +327,7 @@ def run_benchmark(scene, camera, benchmark_args):
             f"| CPU:{system_utilization_analytics[0]}% | "
             f"RAM:{system_utilization_analytics[1]}% | "
             f"GPU Compute:{system_utilization_analytics[2]}% | "
-            f" GPU Memory: {system_utilization_analytics[3]:.2f}% |"
+            f"GPU Memory: {system_utilization_analytics[3]:.2f}% |"
         )
 
         scene.reset()
@@ -376,45 +343,35 @@ def run_benchmark(scene, camera, benchmark_args):
                scene.step()
 
         # fill gpu cache with random data
-        fill_gpu_cache_with_random_data()
+        # benchmark_utils.fill_gpu_cache_with_random_data()
 
-        # timer
-        image_dir = os.path.splitext(benchmark_args.benchmark_result_file_path)[0]
-        os.makedirs(image_dir, exist_ok=True)
-        from time import time
-        start_time = time()
+        # Create an image exporter
+        image_dir = os.path.splitext(benchmark_args.benchmark_result_file)[0]
+        exporter = FrameImageExporter(image_dir)
 
+        # Profiler
+        profiler = BenchmarkProfiler(n_steps, n_envs)
         for i in range(n_steps):
-            camera.update(dt)
-            rgb_tiles = camera.data.output.get("rgb").detach().cpu().numpy()
-            depth_tiles = camera.data.output.get("depth").detach().cpu().numpy()
-            # print(rgb_tiles.shape, depth_tiles.shape)
-            # print(rgb_tiles.dtype, depth_tiles.dtype)
+            profiler.on_simulation_start()
+            scene.step(render=False)
+            profiler.on_rendering_start()
+            scene.render()
+            # camera.update(dt, force_recompute=True)
+            # rgb_tiles = camera.data.output.get("rgb")
+            # depth_tiles = camera.data.output.get("depth")
+            profiler.on_rendering_end()
+            # exporter.export_frame_single_cam(i, 0, rgb=rgb_tiles, depth=depth_tiles)
 
-            # for j in range(n_envs):
-            #     rgb_image = Image.fromarray(rgb_tiles[j])
-            #     rgb_name = f"image_rgb_{i}_{j}_bounce{benchmark_args.max_bounce}_spp{benchmark_args.spp}_shadow{shadow}.png"
-            #     rgb_path = os.path.join(image_dir, rgb_name)
-            #     rgb_image.save(rgb_path)
-            #     print("Image saved:", rgb_path)
+        profiler.end()
+        profiler.print_summary()    
+        
+        time_taken_gpu = profiler.get_total_rendering_gpu_time()
+        time_taken_cpu = profiler.get_total_rendering_cpu_time()
+        time_taken_per_env_gpu = profiler.get_total_rendering_gpu_time_per_env()
+        time_taken_per_env_cpu = profiler.get_total_rendering_cpu_time_per_env()
+        fps = profiler.get_rendering_fps()
+        fps_per_env = profiler.get_rendering_fps_per_env()
 
-            #     depth_tile = depth_tiles[j][:, :, 0]
-            #     depth_tile = ((1.0 - (depth_tile / np.max(depth_tile))) * 255.0).astype(np.uint8)
-            #     depth_image = Image.fromarray(depth_tile, mode="L")
-            #     depth_path = os.path.join(image_dir, f"image_depth_{i}_{j}.png")
-            #     depth_image.save(depth_path)
-            #     print("Image saved:", depth_path)
-
-        end_time = time()
-        time_taken = end_time - start_time
-        time_taken_per_env = time_taken / n_envs
-        fps = n_envs * n_steps / time_taken
-        fps_per_env = n_steps / time_taken
-        system_utilization_analytics = get_utilization_percentages()
-        print(f'Time taken: {time_taken} seconds')
-        print(f'Time taken per env: {time_taken_per_env} seconds')
-        print(f'FPS: {fps}')
-        print(f'FPS per env: {fps_per_env}')
         print(
             f"| CPU:{system_utilization_analytics[0]}% | "
             f"RAM:{system_utilization_analytics[1]}% | "
@@ -423,8 +380,9 @@ def run_benchmark(scene, camera, benchmark_args):
         )
 
         # Append a line with all args and results in csv format
-        with open(benchmark_args.benchmark_result_file_path, 'a') as f:
-            f.write(f'succeeded,{benchmark_args.mjcf},{benchmark_args.rasterizer},{benchmark_args.n_envs},{benchmark_args.n_steps},{benchmark_args.resX},{benchmark_args.resY},{benchmark_args.camera_posX},{benchmark_args.camera_posY},{benchmark_args.camera_posZ},{benchmark_args.camera_lookatX},{benchmark_args.camera_lookatY},{benchmark_args.camera_lookatZ},{benchmark_args.camera_fov},{time_taken},{time_taken_per_env},{fps},{fps_per_env}\n')
+        os.makedirs(os.path.dirname(benchmark_args.benchmark_result_file), exist_ok=True)
+        with open(benchmark_args.benchmark_result_file, 'a') as f:
+            f.write(f'succeeded,{benchmark_args.mjcf},{benchmark_args.renderer},{benchmark_args.rasterizer},{benchmark_args.n_envs},{benchmark_args.n_steps},{benchmark_args.resX},{benchmark_args.resY},{benchmark_args.camera_posX},{benchmark_args.camera_posY},{benchmark_args.camera_posZ},{benchmark_args.camera_lookatX},{benchmark_args.camera_lookatY},{benchmark_args.camera_lookatZ},{benchmark_args.camera_fov},{time_taken_gpu},{time_taken_per_env_gpu},{time_taken_cpu},{time_taken_per_env_cpu},{fps},{fps_per_env}\n')
         
         print("App closing..")
         # app.close()
@@ -435,7 +393,6 @@ def run_benchmark(scene, camera, benchmark_args):
         raise
 
 def main():
-
     ######################## Initialize scene #######################
     scene, camera = init_isaac(benchmark_args)
 
@@ -444,4 +401,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
