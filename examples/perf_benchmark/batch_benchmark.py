@@ -263,6 +263,7 @@ def run_batch_benchmark(batch_args_dict, previous_runs=None):
                         ])
                         try:
                             # Read timeout from config
+                            print(" ".join(cmd))
                             process = subprocess.Popen(cmd)
                             try:
                                 # Hack to avoid omniverse runs to take forever.

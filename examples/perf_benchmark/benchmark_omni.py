@@ -1,52 +1,64 @@
-# Before running, convert the assets like:
-# python examples/perf_benchmark/process_xml.py \
-#   --file ./genesis/assets/xml/franka_emika_panda/panda.xml
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
 
 ######################## Parse arguments #######################
-# Create a struct to store the arguments
 import argparse
 from batch_benchmark import BenchmarkArgs
-benchmark_args = BenchmarkArgs.parse_benchmark_args()
-
+args_cli = BenchmarkArgs.parse_benchmark_args()
 ######################## Launch app #######################
 from isaaclab.app import AppLauncher
 app = AppLauncher(
-    headless=not benchmark_args.gui,
+    headless=not args_cli.gui,
     enable_cameras=True,
     device="cuda:0",
-    rendering_mode="performance",
 ).app
 
-import carb
-import isaaclab.sim as sim_utils
+"""Rest everything follows."""
+import pynvml
+import torch
+import os
+import math
+from PIL import Image
+import psutil
+from scipy.spatial.transform import Rotation as R
+from pxr import PhysxSchema
+from benchmark_profiler import BenchmarkProfiler
+
 import isaacsim.core.utils.prims as prim_utils
-import isaacsim.core.utils.stage as stage_utils
-from isaaclab.sensors.camera import TiledCamera, TiledCameraCfg
-from isaaclab.sim.converters import (
-    MjcfConverter, MjcfConverterCfg,
-    UrdfConverter, UrdfConverterCfg
+import isaacsim.core.utils.stage as stage_utils 
+import isaaclab.sim as sim_utils
+import isaaclab.assets as asset_utils
+import isaaclab_assets.robots as asset_robots
+from isaaclab.scene.interactive_scene import InteractiveScene
+from isaaclab.sensors import (
+    Camera,
+    CameraCfg,
+    RayCasterCamera,
+    RayCasterCameraCfg,
+    TiledCamera,
+    TiledCameraCfg,
+    patterns,
 )
+import carb
+import omni.replicator.core as rep
 from isaaclab.utils.math import (
+    orthogonalize_perspective_depth,
+    unproject_depth,
     create_rotation_matrix_from_view,
     quat_from_matrix,
 )
-import omni.replicator.core as rep
-from pxr import UsdLux, PhysxSchema
-
+from isaaclab.utils import configclass
+from isaaclab_tasks.utils import load_cfg_from_registry
+from isaaclab.envs import ManagerBasedEnvCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim.converters import (
+    MjcfConverter, MjcfConverterCfg
+)
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.asset.importer.mjcf")
-
-import os
-import math
-import numpy as np
-import torch
-import psutil
-import pynvml
-from scipy.spatial.transform import Rotation as R
-from genesis.utils.image_exporter import FrameImageExporter
-import benchmark_utils
-from benchmark_profiler import BenchmarkProfiler
-
+import isaacsim.asset.importer.mjcf
 
 def load_mjcf(mjcf_path):
     return MjcfConverter(
@@ -57,17 +69,80 @@ def load_mjcf(mjcf_path):
         )
     ).usd_path
 
-def load_urdf(urdf_path):
-    return UrdfConverter(
-        UrdfConverterCfg(
-            asset_path=urdf_path,
-            joint_drive=None,
-            fix_base=True,
-            force_usd_conversion=True
+def get_robot_config():
+    robot_name = f"{os.path.splitext(args_cli.mjcf)[0]}_new.xml"
+    robot_basename = os.path.splitext(os.path.basename(robot_name))[0]
+    robot_name = os.path.join(os.path.dirname(robot_name), robot_basename, f"{robot_basename}.usd")
+    robot_path = os.path.abspath(os.path.join("genesis/assets", robot_name))
+    print("Robot asset:", robot_path)
+
+    if args_cli.mjcf.endswith("g1.xml"):
+        robot_cfg = asset_utils.AssetBaseCfg(
+            spawn=asset_robots.unitree.G1_CFG.spawn.copy()
         )
-    ).usd_path
+    elif args_cli.mjcf.endswith("go2.xml"):
+        robot_cfg = asset_utils.AssetBaseCfg(
+            spawn=asset_robots.unitree.UNITREE_GO2_CFG.spawn.copy()
+        )
+    elif args_cli.mjcf.endswith("panda.xml"):
+        robot_cfg = asset_utils.AssetBaseCfg(
+            spawn=asset_robots.franka.FRANKA_PANDA_CFG.spawn.copy()
+        )
+    else:
+        raise Exception(f"Invalid robot: {args_cli.mjcf}")
+    robot_cfg.spawn.usd_path = robot_path
+    return robot_cfg.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+def get_dir_light_config():
+    dir_light_pos = torch.Tensor([[0.0, 0.0, 1.5]])
+    dir_light_quat = quat_from_matrix(
+        create_rotation_matrix_from_view(
+            dir_light_pos,
+            torch.Tensor([[1.0, 1.0, -2.0]]),
+            stage_utils.get_stage_up_axis()))
+    dir_light_pos = tuple(dir_light_pos.detach().cpu().squeeze().numpy())
+    dir_light_quat = tuple(dir_light_quat.detach().cpu().squeeze().numpy())
+    dir_light_cfg = asset_utils.AssetBaseCfg(
+        prim_path="/World/direct_light",
+        spawn=sim_utils.DistantLightCfg(intensity=500.0, angle=45.0),
+        init_state=asset_utils.AssetBaseCfg.InitialStateCfg(
+            pos=dir_light_pos, rot=dir_light_quat
+        )
+    )
+    return dir_light_cfg
+
+
+@configclass
+class RobotSceneCfg(InteractiveSceneCfg):
+    """Configuration for a cart-pole scene."""
+
+    # ground plane
+    ground = asset_utils.AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/ground",  # Each environment should have a ground 
+        # prim_path="/World/ground",        # All environment shares a ground (about 2x performance)
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=os.path.abspath("genesis/assets/urdf/plane_usd/plane.usd")
+        ),
+    )
+
+    # g1/go2
+    robot: asset_utils.ArticulationCfg = get_robot_config()
+
+    # lights
+    dir_light = get_dir_light_config()
+
+
+def apply_benchmark_physics_settings():
+    stage = stage_utils.get_current_stage()
+    physxSceneAPI = PhysxSchema.PhysxSceneAPI.Apply(stage.GetPrimAtPath("/physicsScene"))
+    physxSceneAPI.CreateGpuTempBufferCapacityAttr(16 * 1024 * 1024 * 2)
+    physxSceneAPI.CreateGpuHeapCapacityAttr(64 * 1024 * 1024 * 2)
+    physxSceneAPI.CreateGpuMaxRigidPatchCountAttr(8388608)
+    physxSceneAPI.CreateGpuMaxRigidContactCountAttr(16777216)
+
 
 def apply_benchmark_carb_settings(print_changes=False):
+    rep.settings.set_render_rtx_realtime()
     settings = carb.settings.get_settings()
     # Print settings before applying the settings
     if print_changes:
@@ -92,7 +167,7 @@ def apply_benchmark_carb_settings(print_changes=False):
         print("vsync:", settings.get("/app/window/vsync"))
 
     # Options: https://docs.omniverse.nvidia.com/materials-and-rendering/latest/rtx-renderer_pt.html
-    if benchmark_args.rasterizer:
+    if args_cli.rasterizer:
         # carb_settings.set("/rtx/rendermode", "Hydra Storm")
         settings.set("/rtx/rendermode", "RayTracedLighting")
     else:
@@ -100,10 +175,10 @@ def apply_benchmark_carb_settings(print_changes=False):
     settings.set("/rtx/shadows/enabled", False)
 
     # Path tracing settings
-    settings.set("/rtx/pathtracing/spp", benchmark_args.spp)
-    settings.set("/rtx/pathtracing/totalSpp", benchmark_args.spp)
-    settings.set("/rtx/pathtracing/clampSpp", benchmark_args.spp)
-    settings.set("/rtx/pathtracing/maxBounces", benchmark_args.max_bounce)
+    settings.set("/rtx/pathtracing/spp", args_cli.spp)
+    settings.set("/rtx/pathtracing/totalSpp", args_cli.spp)
+    settings.set("/rtx/pathtracing/clampSpp", args_cli.spp)
+    settings.set("/rtx/pathtracing/maxBounces", args_cli.max_bounce)
     settings.set("/rtx/pathtracing/optixDenoiser/enabled", False)
     settings.set("/rtx/pathtracing/adaptiveSampling/enabled", False)
 
@@ -147,130 +222,68 @@ def apply_benchmark_carb_settings(print_changes=False):
         print("exposure/enabled:", settings.get("/rtx/post/exposure/enabled"))
         print("vsync:", settings.get("/app/window/vsync"))
 
-def init_isaac(benchmark_args):
-    ########################## init ##########################
-    stage_utils.create_new_stage()
-    stage = stage_utils.get_current_stage()
-    scene = sim_utils.SimulationContext(
-        sim_utils.SimulationCfg(device="cuda:0", dt=0.01,)
+# python3 /home/zhehuan/Desktop/hz/tmp/Genesis/examples/perf_benchmark/benchmark_omni_env.py --rasterizer --renderer omniverse --n_envs 256 --resX 128 --resY 128 --mjcf xml/franka_emika_panda/panda.xml --benchmark_result_file logs/benchmark/batch_benchmark_20250623_145352.csv --benchmark_config_file benchmark_config_smoke_test.yml
+
+def create_scene():
+    """Loads the task, sticks cameras into the config, and creates the environment."""
+    # cfg = load_cfg_from_registry(task, "env_cfg_entry_point")
+
+    sim_cfg = sim_utils.SimulationCfg(
+        device="cuda:0", dt=0.01, use_fabric=False,
     )
-    cam_eye = (
-        benchmark_args.camera_posX,
-        benchmark_args.camera_posY,
-        benchmark_args.camera_posZ
-    )
-    cam_target = (
-        benchmark_args.camera_lookatX,
-        benchmark_args.camera_lookatY,
-        benchmark_args.camera_lookatZ
-    )
-    scene.set_camera_view(eye=cam_eye, target=cam_target)
-    cam_eye = torch.Tensor(cam_eye).reshape(-1, 3)
-    cam_target = torch.Tensor(cam_target).reshape(-1, 3)
+    sim = sim_utils.SimulationContext(sim_cfg)
+    scene_cfg = RobotSceneCfg(num_envs=args_cli.n_envs, env_spacing=10.0)
+    sim.set_camera_view([2.5, 0.0, 4.0], [0.0, 0.0, 2.0])
 
-    physxSceneAPI = PhysxSchema.PhysxSceneAPI.Apply(stage.GetPrimAtPath("/physicsScene"))
-    physxSceneAPI.CreateGpuTempBufferCapacityAttr(16 * 1024 * 1024 * 2)
-    physxSceneAPI.CreateGpuHeapCapacityAttr(64 * 1024 * 1024 * 2)
-    physxSceneAPI.CreateGpuMaxRigidPatchCountAttr(8388608)
-    physxSceneAPI.CreateGpuMaxRigidContactCountAttr(16777216)
+    apply_benchmark_physics_settings()
+    apply_benchmark_carb_settings(True)
 
-    rep.settings.set_render_rtx_realtime()
-    apply_benchmark_carb_settings()
+    camera_fov = math.radians(args_cli.camera_fov)
+    camera_aperture = 20.955
+    camera_fol = camera_aperture / (2 * math.tan(camera_fov / 2))
 
-    ########################## entities ##########################
-    spacing_row = np.array((2.0, -6.0))
-    spacing_col = np.array((-6.0, -2.0))
-    n_cols = int(math.sqrt(benchmark_args.n_envs))
-    offsets = []
-    for i in range(benchmark_args.n_envs):
-        col = i % n_cols
-        row = i // n_cols
-        offset_XY = (row * spacing_row + col * spacing_col)
-        offset = np.array([*offset_XY, 0.0])
-        offsets.append(offset)
-        prim_utils.create_prim(
-            f"/World/Origin{i:05d}", "Xform", translation=offset
-        )
-    offsets = np.array(offsets)
-
-    # load objects
-    plane_path = os.path.abspath(os.path.join("genesis/assets", "urdf/plane_usd/plane.usd"))
-    print(plane_path)
-    plane_cfg = sim_utils.UsdFileCfg(usd_path=plane_path)
-    plane_cfg.func("/World/Origin.*/plane", plane_cfg)
-
-    robot_name = f"{os.path.splitext(benchmark_args.mjcf)[0]}_new.xml"
-    robot_path = load_mjcf(os.path.join("genesis/assets", robot_name))
-    print("Robot asset:", robot_path)
-    robot_cfg = sim_utils.UsdFileCfg(usd_path=robot_path)
-    robot_cfg.func("/World/Origin.*/robot", robot_cfg)
-
-    cam_fov = math.radians(benchmark_args.camera_fov)
-    cam_hapert = 20.955
-    cam_fol = cam_hapert / (2 * math.tan(cam_fov / 2))
-    cam_quat = quat_from_matrix(
+    num_cameras = args_cli.n_envs
+    camera_pos = torch.tensor((
+        args_cli.camera_posX,
+        args_cli.camera_posY,
+        args_cli.camera_posZ
+    )).reshape(-1, 3)
+    camera_lookat = torch.tensor((
+        args_cli.camera_lookatX,
+        args_cli.camera_lookatY,
+        args_cli.camera_lookatZ
+    )).reshape(-1, 3)
+    camera_quat = quat_from_matrix(
         create_rotation_matrix_from_view(
-            cam_target, cam_eye, stage_utils.get_stage_up_axis()
+            camera_lookat, camera_pos, stage_utils.get_stage_up_axis()
         ) @ R.from_euler('z', 180, degrees=True).as_matrix()   
     )
-    cam_eye = tuple(cam_eye.detach().cpu().squeeze().numpy())
-    cam_quat = tuple(cam_quat.detach().cpu().squeeze().numpy())
-
-    print(cam_eye, cam_quat)
-    print(type(cam_eye), type(cam_quat))
-
-    cam_0 = TiledCamera(
-        TiledCameraCfg(
-            height=benchmark_args.resX,
-            width=benchmark_args.resY,
-            offset=TiledCameraCfg.OffsetCfg(
-                pos=cam_eye,
-                rot=cam_quat,
-                convention="ros"
-            ),
-            prim_path="/World/Origin.*/camera",
-            update_period=0,
-            data_types=["rgb", "depth"],
-            spawn=sim_utils.PinholeCameraCfg(
-                focal_length=cam_fol,
-            ),
-        )
+    camera_pos = tuple(camera_pos.detach().cpu().squeeze().numpy())
+    camera_quat = tuple(camera_quat.detach().cpu().squeeze().numpy())
+    camera_cfg = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/tiled_camera",
+        update_period=0,
+        height=args_cli.resX,
+        width=args_cli.resY,
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=camera_pos,
+            rot=camera_quat,
+            convention="ros"
+        ),
+        data_types=["rgb", "depth"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=camera_fol,
+            horizontal_aperture=camera_aperture,
+        ),
     )
+    setattr(scene_cfg, "tiled_camera", camera_cfg)
+    scene = InteractiveScene(scene_cfg)
+    return sim, scene
 
-    ########################## cameras ##########################
-    dir_light_pos = torch.Tensor([[0.0, 0.0, 1.5]])
-    dir_light_quat = quat_from_matrix(
-        create_rotation_matrix_from_view(
-            dir_light_pos,
-            torch.Tensor([[1.0, 1.0, -2.0]]),
-            stage_utils.get_stage_up_axis()))
-    dir_light_pos = tuple(dir_light_pos.detach().cpu().squeeze().numpy())
-    dir_light_quat = tuple(dir_light_quat.detach().cpu().squeeze().numpy())
-    dir_light_cfg = sim_utils.DistantLightCfg(intensity=500.0, angle=45.0)
-    dir_light_prim = dir_light_cfg.func(
-        "/World/DirectionalLight", dir_light_cfg,
-        translation=dir_light_pos,
-        orientation=dir_light_quat)
 
-    cone_light_pos = torch.Tensor([[4, -4, 4]])
-    cone_light_quat = quat_from_matrix(
-        create_rotation_matrix_from_view(
-            cone_light_pos,
-            torch.Tensor([[-1, 1, -1]]),
-            stage_utils.get_stage_up_axis()))
-    cone_light_cfg = sim_utils.SphereLightCfg(intensity=1000.0, radius=0.1)
-    cone_light_pos = tuple(cone_light_pos.detach().cpu().squeeze().numpy())
-    cone_light_quat = tuple(cone_light_quat.detach().cpu().squeeze().numpy())
-    cone_light_prim = cone_light_cfg.func(
-        "/World/ConeLight", cone_light_cfg,
-        translation=cone_light_pos,
-        orientation=cone_light_quat)
-    cone_light = UsdLux.LightAPI(cone_light_prim)
-    UsdLux.ShapingAPI.Apply(cone_light_prim)
-    cone_light_prim.SetTypeName("SphereLight")
-
-    return scene, cam_0
-
+"""
+System diagnosis
+"""
 def get_utilization_percentages(reset: bool = False, max_values: list[float] = [0.0, 0.0, 0.0, 0.0]) -> list[float]:
     """Get the maximum CPU, RAM, GPU utilization (processing), and
     GPU memory usage percentages since the last time reset was true."""
@@ -310,94 +323,123 @@ def get_utilization_percentages(reset: bool = False, max_values: list[float] = [
         gpu_memory_utilization_percent = None
     return max_values
 
-def fill_gpu_cache_with_random_data():
-    # 100 MB of random data
-    dummy_data = torch.rand(100, 1024, 1024, device="cuda")
-    # Make some random data manipulation to the entire tensor
-    dummy_data = dummy_data.sqrt()
 
-def run_benchmark(scene, camera, benchmark_args):
-    try:
-        n_envs = benchmark_args.n_envs
-        n_steps = benchmark_args.n_steps
+"""
+Experiment
+"""
+def run_simulator(
+    sim: sim_utils.SimulationContext,
+    scene: InteractiveScene,
+) -> dict:
+    """Run the simulator with all cameras, and return timing analytics. Visualize if desired."""
+    n_envs = args_cli.n_envs
+    n_steps = args_cli.n_steps
+    camera = scene["tiled_camera"]
+    camera_data_types = ["rgb", "depth"]
 
-        # warmup
-        system_utilization_analytics = get_utilization_percentages()
-        print(
-            f"| CPU:{system_utilization_analytics[0]}% | "
-            f"RAM:{system_utilization_analytics[1]}% | "
-            f"GPU Compute:{system_utilization_analytics[2]}% | "
-            f"GPU Memory: {system_utilization_analytics[3]:.2f}% |"
-        )
+    # Initialize timing variables
+    system_utilization_analytics = get_utilization_percentages()
+    print(
+        f"| CPU:{system_utilization_analytics[0]}% | "
+        f"RAM:{system_utilization_analytics[1]}% | "
+        f"GPU Compute:{system_utilization_analytics[2]}% | "
+        f"GPU Memory: {system_utilization_analytics[3]:.2f}% |"
+    )
+    sim.reset()
+    dt = sim.get_physics_dt()
+    n_warm_steps = 3
+    for i in range(n_warm_steps):
+        print(f"Warm up step {i}.")
+        sim.step()
+        camera.update(dt)
+        _ = camera.data
 
-        scene.reset()
-        dt = scene.get_physics_dt()
-        for i in range(3):
-            scene.step()
-            camera.update(dt)
-            _ = camera.data
-        print("Env and steps:", n_envs, n_steps)
+    print("Warm up finished.")
+    image_dir = os.path.splitext(args_cli.benchmark_result_file)[0]
+    # exporter = FrameImageExporter(image_dir)
+    # experiment_length = args_cli.n_steps + n_warm_steps
+
+    profiler = BenchmarkProfiler(n_steps, n_envs)
+    for i in range(n_steps):
+        print(f"Step {i}:")
+        get_utilization_percentages()
+        print("Utilization percentages got!")
+
+        # Measure the total simulation step time
+        profiler.on_simulation_start()
+        sim.step(render=False)
+        profiler.on_rendering_start()
+        sim.render()
+
+        # Update cameras and process vision data within the simulation step
+        # Loop through all camera lists and their data_types
+        camera.update(dt=dt)
+        print("Camera updated!")
+        rgb_tiles = camera.data.output.get("rgb")
+        depth_tiles = camera.data.output.get("depth")
+        profiler.on_rendering_end()
+        # exporter.export_frame_single_cam(i, 0, rgb=rgb_tiles, depth=depth_tiles)
+
+        # rgb_tiles = rgb_tiles.detach().cpu().numpy()
+        # for j in range(n_envs):
+        #     rgb_image = rgb_tiles[j]
+        #     rgb_image = Image.fromarray(rgb_image)
+
+        #     image_name = f"rgb_{j}_env.png"
+        #     image_path = os.path.join(image_dir, image_name)
+        #     rgb_image.save(image_path)
+        #     print("Image saved:", image_path)
+        # End timing for the step
+
+    profiler.end()
+    profiler.print_summary()
+
+    time_taken_gpu = profiler.get_total_rendering_gpu_time()
+    time_taken_cpu = profiler.get_total_rendering_cpu_time()
+    time_taken_per_env_gpu = profiler.get_total_rendering_gpu_time_per_env()
+    time_taken_per_env_cpu = profiler.get_total_rendering_cpu_time_per_env()
+    fps = profiler.get_rendering_fps()
+    fps_per_env = profiler.get_rendering_fps_per_env()
+    system_utilization_analytics = get_utilization_percentages()
+
+    system_utilization_analytics = get_utilization_percentages()
+    print(
+        f"| CPU:{system_utilization_analytics[0]}% | "
+        f"RAM:{system_utilization_analytics[1]}% | "
+        f"GPU Compute:{system_utilization_analytics[2]}% | "
+        f" GPU Memory: {system_utilization_analytics[3]:.2f}% |"
+    )
+
+    os.makedirs(os.path.dirname(args_cli.benchmark_result_file), exist_ok=True)
+    with open(args_cli.benchmark_result_file, 'a') as f:
+        f.write(f'succeeded,{args_cli.mjcf},{args_cli.renderer},'
+                f'{args_cli.rasterizer},{args_cli.n_envs},{args_cli.n_steps},'\
+                f'{args_cli.resX},{args_cli.resY},'
+                f'{args_cli.camera_posX},{args_cli.camera_posY},{args_cli.camera_posZ},'
+                f'{args_cli.camera_lookatX},{args_cli.camera_lookatY},{args_cli.camera_lookatZ},'
+                f'{args_cli.camera_fov},'
+                f'{time_taken_gpu},{time_taken_per_env_gpu},{time_taken_cpu},'
+                f'{time_taken_per_env_cpu},{fps},{fps_per_env}\n')
         
-        if benchmark_args.gui:
-            while True:
-               scene.step()
+    print("App closing..")
+    # app.close()
+    print("App closed!")
 
-        # fill gpu cache with random data
-        # benchmark_utils.fill_gpu_cache_with_random_data()
-
-        # Create an image exporter
-        image_dir = os.path.splitext(benchmark_args.benchmark_result_file)[0]
-        exporter = FrameImageExporter(image_dir)
-
-        # Profiler
-        profiler = BenchmarkProfiler(n_steps, n_envs)
-        for i in range(n_steps):
-            profiler.on_simulation_start()
-            scene.step(render=False)
-            profiler.on_rendering_start()
-            scene.render()
-            # camera.update(dt, force_recompute=True)
-            # rgb_tiles = camera.data.output.get("rgb")
-            # depth_tiles = camera.data.output.get("depth")
-            profiler.on_rendering_end()
-            # exporter.export_frame_single_cam(i, 0, rgb=rgb_tiles, depth=depth_tiles)
-
-        profiler.end()
-        profiler.print_summary()    
-        
-        time_taken_gpu = profiler.get_total_rendering_gpu_time()
-        time_taken_cpu = profiler.get_total_rendering_cpu_time()
-        time_taken_per_env_gpu = profiler.get_total_rendering_gpu_time_per_env()
-        time_taken_per_env_cpu = profiler.get_total_rendering_cpu_time_per_env()
-        fps = profiler.get_rendering_fps()
-        fps_per_env = profiler.get_rendering_fps_per_env()
-
-        print(
-            f"| CPU:{system_utilization_analytics[0]}% | "
-            f"RAM:{system_utilization_analytics[1]}% | "
-            f"GPU Compute:{system_utilization_analytics[2]}% | "
-            f" GPU Memory: {system_utilization_analytics[3]:.2f}% |"
-        )
-
-        # Append a line with all args and results in csv format
-        os.makedirs(os.path.dirname(benchmark_args.benchmark_result_file), exist_ok=True)
-        with open(benchmark_args.benchmark_result_file, 'a') as f:
-            f.write(f'succeeded,{benchmark_args.mjcf},{benchmark_args.renderer},{benchmark_args.rasterizer},{benchmark_args.n_envs},{benchmark_args.n_steps},{benchmark_args.resX},{benchmark_args.resY},{benchmark_args.camera_posX},{benchmark_args.camera_posY},{benchmark_args.camera_posZ},{benchmark_args.camera_lookatX},{benchmark_args.camera_lookatY},{benchmark_args.camera_lookatZ},{benchmark_args.camera_fov},{time_taken_gpu},{time_taken_per_env_gpu},{time_taken_cpu},{time_taken_per_env_cpu},{fps},{fps_per_env}\n')
-        
-        print("App closing..")
-        # app.close()
-        print("App closed!")
-    
-    except Exception as e:
-        print(f"Error during benchmark: {e}")
-        raise
 
 def main():
-    ######################## Initialize scene #######################
-    scene, camera = init_isaac(benchmark_args)
+    """Main function."""
+    # Load simulation context
+    print("[INFO]: Designing the scene")
+    print("[INFO]: Using known task environment, injecting cameras.")
+    sim, scene = create_scene()
+    run_simulator(sim=sim, scene=scene)
+    print("[INFO]: DONE! Feel free to CTRL + C Me ")
+    print("Keep in mind, this is without any training running on the GPU.")
+    print("Set lower utilization thresholds to account for training.")
 
-    ######################## Run benchmark #######################
-    run_benchmark(scene, camera, benchmark_args)
 
 if __name__ == "__main__":
+    # run the main function
     main()
+    # close sim app
+    # simulation_app.close()
