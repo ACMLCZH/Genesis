@@ -7,6 +7,7 @@ from PIL import Image
 import gymnasium as gym
 import sapien
 from mani_skill.envs.sapien_env import BaseEnv
+from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.registration import register_env
@@ -29,20 +30,6 @@ class SingleRobotBenchmarkEnv(BaseEnv):
         self.camera_lookat = camera_lookat
         self.camera_fov = camera_fov
         super().__init__(*args, robot_uids=robot_uid, **kwargs)
-
-    @property
-    def _default_sensor_configs(self):
-        pose = sapien_utils.look_at(self.camera_pos, self.camera_lookat)
-        sensor_configs = []
-        sensor_configs.append(CameraConfig(
-            uid=f"base_camera",
-            pose=pose,
-            width=self.camera_width,
-            height=self.camera_height,
-            fov=self.camera_fov,
-            shader_pack=self.camera_mode,
-        ))
-        return sensor_configs
     
     @property
     def _default_human_render_camera_configs(self):
@@ -65,7 +52,7 @@ class SingleRobotBenchmarkEnv(BaseEnv):
         urdf_loader.fix_root_link = True
         ground_actor = urdf_loader.parse(ground_path)["actor_builders"][0]
         ground_actor._auto_inertial = True      # Force ground urdf to be static!
-        self.ground = ground_actor.build_static(name="ground")
+        # self.ground = ground_actor.build_static(name="ground")
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
@@ -115,10 +102,15 @@ def main():
     env_id = "SingleRobotBenchmark-v1"
     n_envs = args.n_envs
     n_steps = args.n_steps
-    sim_config = dict(
+    sim_config = SimConfig(
+        gpu_memory_config = GPUMemoryConfig(
+            max_rigid_contact_count=n_envs * max(1024, n_envs) * 80,
+            max_rigid_patch_count=n_envs * max(1024, n_envs) * 4,
+            found_lost_pairs_capacity=2**26,
+        ),
         sim_freq=100,       # dt = 0.01
         control_freq=100,   # substep = 1
-        spacing=5.0,
+        spacing=10.0,
     )
 
     if args.mjcf.endswith("panda.xml"):
@@ -129,16 +121,19 @@ def main():
         robot_uid = "unitree_g1"
     else:
         raise Exception(f"Invalid robot: {args.mjcf}")
-    if not args.rasterizer:
-        raise Exception(f"ManiSkill does not support raytracer for batch rendering.")
-
+    
+    if args.rasterizer:
+        camera_mode = "minimal"
+        # raise Exception(f"ManiSkill does not support raytracer for batch rendering.")
+    else:
+        camera_mode = "rt-fast"
     save_image = True
+    obs_mode = "rgbd"   # Using "state" will be slower
     render_mode = "rgb_array"   # "human for GUI"
-    camera_mode = "minimal"
     env = gym.make(
         env_id,
         num_envs=n_envs,
-        obs_mode="rgbd",
+        obs_mode=obs_mode,
         render_mode=render_mode,
         control_mode="pd_joint_delta_pos",
         sim_config=sim_config,
@@ -146,6 +141,7 @@ def main():
         camera_mode=camera_mode,
         camera_width=args.resY,
         camera_height=args.resX,
+        # parallel_in_single_scene=True,  # This actually combines all environments into a single env, is it batch rendering?
     )
     if isinstance(env.action_space, gym.spaces.Dict):
         env = FlattenActionSpaceWrapper(env)
@@ -165,6 +161,7 @@ def main():
         env.reset(seed=2022)
         for i in range(n_steps):
             # obs, rew, terminated, truncated, info = env.step(actions)
+            print(f"Step: {i}")
             profiler.on_simulation_start()
             profiler.on_rendering_start()
             if render_mode == "human":
