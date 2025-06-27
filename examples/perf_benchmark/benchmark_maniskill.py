@@ -52,7 +52,7 @@ class SingleRobotBenchmarkEnv(BaseEnv):
         urdf_loader.fix_root_link = True
         ground_actor = urdf_loader.parse(ground_path)["actor_builders"][0]
         ground_actor._auto_inertial = True      # Force ground urdf to be static!
-        # self.ground = ground_actor.build_static(name="ground")
+        self.ground = ground_actor.build_static(name="ground")
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
