@@ -32,22 +32,27 @@ class SingleRobotBenchmarkEnv(BaseEnv):
         super().__init__(*args, robot_uids=robot_uid, **kwargs)
     
     @property
+    def _default_sensor_configs(self):
+        return [
+            CameraConfig(
+                uid="render_camera",
+                pose=sapien_utils.look_at(self.camera_pos, self.camera_lookat),
+                width=self.camera_width,
+                height=self.camera_height,
+                fov=self.camera_fov,
+                shader_pack=self.camera_mode,
+            ),
+        ]
+    
+    @property
     def _default_human_render_camera_configs(self):
-        return CameraConfig(
-            uid="render_camera",
-            pose=sapien_utils.look_at(self.camera_pos, self.camera_lookat),
-            width=self.camera_width,
-            height=self.camera_height,
-            fov=self.camera_fov,
-            shader_pack=self.camera_mode,
-        )
+        return dict()
     
     def _load_agent(self, options: dict):
         super()._load_agent(options, sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]))
 
     def _load_scene(self, options: dict):
         ground_path = "genesis/assets/urdf/plane/plane.urdf"
-        # ground_path = "/home/zhehuan/Desktop/hz/tmp/Genesis/genesis/assets/urdf/plane/plane.urdf"
         urdf_loader = self.scene.create_urdf_loader()
         urdf_loader.fix_root_link = True
         ground_actor = urdf_loader.parse(ground_path)["actor_builders"][0]
@@ -63,10 +68,8 @@ class SingleRobotBenchmarkEnv(BaseEnv):
     def _load_lighting(self, options: Dict):
         self.scene.add_directional_light(
             [0.26490647, 0.26490647, -0.92717265],    # norm([1.0, 1.0, -2.0] - [0, 0, 1.5])
-            [1.0, 1.0, 1.0],
-            shadow=True,
-            shadow_scale=5,
-            shadow_map_size=2048
+            [3.0, 3.0, 3.0],
+            shadow=False,
         )
     
     def _get_obs_extra(self, info: Dict):
@@ -76,26 +79,6 @@ class SingleRobotBenchmarkEnv(BaseEnv):
         return {}
 
 
-# @dataclass
-# class Args:
-#     obs_mode: Annotated[str, tyro.conf.arg(aliases=["-o"])] = "state"
-#     control_mode: Annotated[str, tyro.conf.arg(aliases=["-c"])] = "pd_joint_delta_pos"
-#     num_envs: Annotated[int, tyro.conf.arg(aliases=["-n"])] = 16
-#     """Whether to use the CPU or GPU simulation"""
-#     robot_uid: str = "panda"
-#     seed: int = 0
-#     control_freq: int = 100
-#     sim_freq: int = 100
-#     num_steps: int = 1000
-#     cam_mode: str = "minimal"
-#     cam_width: int = 1024   # Width of cameras. Only used by benchmark environments"""
-#     cam_height: int = 1024  # Height of cameras. Only used by benchmark environments"""
-#     render_mode: str = "rgb_array"  # Which set of cameras/sensors to render for video saving.
-#     # 'cameras' value will save a video showing all sensor/camera data in the observation, e.g. rgb and depth.
-#     # 'rgb_array' value will show a higher quality render of the environment running
-#     save_video: bool = False    # Whether to save videos
-#     save_results: Optional[str] = None  # Path to save results to. Should be path/to/results.csv"""
-    
 def main():
     args = BenchmarkArgs.parse_benchmark_args()
     
@@ -124,12 +107,11 @@ def main():
     
     if args.rasterizer:
         camera_mode = "minimal"
-        # raise Exception(f"ManiSkill does not support raytracer for batch rendering.")
     else:
         camera_mode = "rt-fast"
     save_image = True
-    obs_mode = "rgbd"   # Using "state" will be slower
-    render_mode = "rgb_array"   # "human for GUI"
+    obs_mode = "rgbd"   # Or "rgb"
+    render_mode = "sensors"   # "human for GUI"
     env = gym.make(
         env_id,
         num_envs=n_envs,
@@ -157,12 +139,15 @@ def main():
     with torch.inference_mode():
         env.reset(seed=2022)
         for i in range(3):
-            env.step(env.action_space.sample())  # warmup step
+            env.step(None)  # warmup step
+            env.render()
         env.reset(seed=2022)
         for i in range(n_steps):
             # obs, rew, terminated, truncated, info = env.step(actions)
-            print(f"Step: {i}")
             profiler.on_simulation_start()
+            obs = env.step(None)[0]
+            # image_tile = obs["sensor_data"]["render_camera"]["rgb"]
+            print(f"Step: {i}")
             profiler.on_rendering_start()
             if render_mode == "human":
                 viewer = env.render()
