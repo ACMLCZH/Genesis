@@ -2,13 +2,16 @@ import numpy as np
 import taichi as ti
 import torch
 
+import igl
+
 import genesis as gs
 import genesis.utils.element as eu
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
+from genesis.engine.coupler import SAPCoupler
 from genesis.engine.states.cache import QueriedStates
 from genesis.engine.states.entities import FEMEntityState
-from genesis.utils.misc import to_gs_tensor
+from genesis.utils.misc import to_gs_tensor, tensor_to_array
 
 from .base_entity import Entity
 
@@ -59,15 +62,16 @@ class FEMEntity(Entity):
         el2tri = np.array(
             [  # follow the order with correct normal
                 [[v[0], v[2], v[1]], [v[1], v[2], v[3]], [v[0], v[1], v[3]], [v[0], v[3], v[2]]] for v in self.elems
-            ]
+            ],
+            dtype=gs.np_int,
         )
-        all_tri = el2tri.reshape(-1, 3)
+        all_tri = el2tri.reshape((-1, 3))
         all_tri_sorted = np.sort(all_tri, axis=1)
         _, unique_idcs, cnt = np.unique(all_tri_sorted, axis=0, return_counts=True, return_index=True)
         unique_tri = all_tri[unique_idcs]
         surface_tri = unique_tri[cnt == 1]
 
-        self._surface_tri_np = surface_tri.astype(gs.np_int)
+        self._surface_tri_np = surface_tri
         self._n_surfaces = len(self._surface_tri_np)
 
         if self._n_surfaces > 0:
@@ -75,12 +79,12 @@ class FEMEntity(Entity):
         else:
             self._n_surface_vertices = 0
 
-        tri2el = np.repeat(np.arange(self.elems.shape[0])[:, None], 4, axis=-1)
-        all_el = tri2el.reshape(
-            -1,
-        )
-        unique_el = all_el[unique_idcs]
-        self._surface_el_np = unique_el[cnt == 1].astype(gs.np_int)
+        tri2el = np.repeat(np.arange(self.elems.shape[0], dtype=gs.np_int)[:, np.newaxis], 4, axis=1)
+        unique_el = tri2el.flat[unique_idcs]
+        self._surface_el_np = unique_el[cnt == 1]
+
+        if isinstance(self.sim.coupler, SAPCoupler):
+            self.compute_pressure_field()
 
         self.init_tgt_vars()
         self.init_ckpt()
@@ -210,7 +214,7 @@ class FEMEntity(Entity):
             if actu.shape == (n_groups,):
                 self._tgt["actu"] = actu.unsqueeze(0).tile((self._sim._B, 1))
                 is_valid = True
-            elif actu.shape == (n_elements,):
+            elif actu.shape == (self.n_elements,):
                 gs.raise_exception("Cannot set per-element actuation.")
         elif actu.ndim == 2:
             if actu.shape == (self._sim._B, n_groups):
@@ -253,7 +257,7 @@ class FEMEntity(Entity):
         if muscle_direction is not None:
             muscle_direction = to_gs_tensor(muscle_direction)
             assert muscle_direction.shape == (self.n_elements, 3)
-            assert torch.allclose(muscle_direction.norm(dim=-1), torch.Tensor([1.0]).to(muscle_direction))
+            assert ((1.0 - muscle_direction.norm(dim=-1)).abs() < gs.EPS).all()
 
             self.set_muscle_direction(muscle_direction)
 
@@ -302,8 +306,8 @@ class FEMEntity(Entity):
         Exception
             If no vertices are provided.
         """
-        verts = verts.astype(gs.np_float)
-        elems = elems.astype(gs.np_int)
+        verts = verts.astype(gs.np_float, copy=False)
+        elems = elems.astype(gs.np_int, copy=False)
 
         # rotate
         R = gu.quat_to_R(np.array(self.morph.quat, dtype=gs.np_float))
@@ -362,8 +366,8 @@ class FEMEntity(Entity):
             )
 
         # Convert to appropriate numpy array types
-        elems_np = self.elems.astype(gs.np_int)
-        verts_numpy = self.init_positions.cpu().numpy().astype(gs.np_float)
+        elems_np = self.elems.astype(gs.np_int, copy=False)
+        verts_numpy = tensor_to_array(self.init_positions, dtype=gs.np_float)
 
         self._solver._kernel_add_elements(
             f=self._sim.cur_substep_local,
@@ -371,6 +375,7 @@ class FEMEntity(Entity):
             mat_mu=self._material.mu,
             mat_lam=self._material.lam,
             mat_rho=self._material.rho,
+            mat_friction_mu=self._material.friction_mu,
             n_surfaces=self._n_surfaces,
             v_start=self._v_start,
             el_start=self._el_start,
@@ -381,6 +386,31 @@ class FEMEntity(Entity):
             tri2el=self._surface_el_np,
         )
         self.active = True
+
+    def compute_pressure_field(self):
+        """
+        Compute the pressure field for the FEM entity based on its tetrahedral elements.
+
+        For hydroelastic contact: https://drake.mit.edu/doxygen_cxx/group__hydroelastic__user__guide.html
+
+        Notes
+        -----
+        https://github.com/RobotLocomotion/drake/blob/master/geometry/proximity/make_mesh_field.cc
+        TODO: Add margin support
+        Drake's implementation of margin seems buggy.
+        """
+        init_positions = tensor_to_array(self.init_positions)
+        signed_distance, *_ = igl.signed_distance(init_positions, init_positions, self._surface_tri_np)
+        signed_distance = signed_distance.astype(gs.np_float, copy=False)
+
+        unsigned_distance = np.abs(signed_distance)
+        max_distance = np.max(unsigned_distance)
+        if max_distance < gs.EPS:
+            gs.raise_exception(
+                f"Pressure field max distance is too small: {max_distance}. "
+                "This might be due to a mesh having no internal vertices."
+            )
+        self.pressure_field_np = unsigned_distance / max_distance * self.material._hydroelastic_modulus  # normalize
 
     # ------------------------------------------------------------------------------------
     # ---------------------------- checkpoint and buffer ---------------------------------

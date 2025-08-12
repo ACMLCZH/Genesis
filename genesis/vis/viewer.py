@@ -1,6 +1,7 @@
 import os
 import threading
 import importlib
+from typing import TYPE_CHECKING
 
 import numpy as np
 import OpenGL.error
@@ -13,6 +14,9 @@ from genesis.ext import pyrender
 from genesis.repr_base import RBC
 from genesis.utils.tools import Rate
 from genesis.utils.misc import redirect_libc_stderr
+
+if TYPE_CHECKING:
+    from genesis.options.vis import ViewerOptions
 
 
 class ViewerLock:
@@ -27,7 +31,7 @@ class ViewerLock:
 
 
 class Viewer(RBC):
-    def __init__(self, options, context):
+    def __init__(self, options: "ViewerOptions", context):
         self._res = options.res
         self._run_in_thread = options.run_in_thread
         self._refresh_rate = options.refresh_rate
@@ -36,6 +40,7 @@ class Viewer(RBC):
         self._camera_init_lookat = options.camera_lookat
         self._camera_up = options.camera_up
         self._camera_fov = options.camera_fov
+        self._enable_interaction = options.enable_interaction
 
         self._pyrender_viewer = None
         self.context = context
@@ -60,9 +65,14 @@ class Viewer(RBC):
         if opengl_platform_orig is None:
             if gs.platform == "Windows":
                 all_opengl_platforms = ("wgl",)  # same as "native"
+            elif gs.platform == "Linux":
+                # "native" is platform-specific ("egl" or "glx")
+                all_opengl_platforms = ("native", "egl", "glx", "osmesa")
             else:
-                all_opengl_platforms = ("native", "egl", "glx")  # "native" is platform-specific ("egl" or "glx")
+                all_opengl_platforms = ("native",)
         else:
+            if gs.platform == "Windows" and opengl_platform_orig == "osmesa":
+                gs.raise_exception("PYOPENGL_PLATFORM='osmesa' is not supported on Windows OS.")
             all_opengl_platforms = (opengl_platform_orig,)
 
         for i, platform in enumerate(all_opengl_platforms):
@@ -82,6 +92,7 @@ class Viewer(RBC):
                         shadow=self.context.shadow,
                         plane_reflection=self.context.plane_reflection,
                         env_separate_rigid=self.context.env_separate_rigid,
+                        enable_interaction=self._enable_interaction,
                         viewer_flags={
                             "window_title": f"Genesis {gs.__version__}",
                             "refresh_rate": self._refresh_rate,
@@ -102,11 +113,10 @@ class Viewer(RBC):
 
                 if i == len(all_opengl_platforms) - 1:
                     raise
-            finally:
-                if opengl_platform_orig is None:
-                    del os.environ["PYOPENGL_PLATFORM"]
-                else:
-                    os.environ["PYOPENGL_PLATFORM"] = opengl_platform_orig
+
+            # Select PyOpenGL backend compatible with `pyrender.OffscreenRenderer`
+            if platform not in ("osmesa", "pyglet", "egl"):
+                os.environ["PYOPENGL_PLATFORM"] = "pyglet"
 
         self.lock = ViewerLock(self._pyrender_viewer)
 
@@ -125,14 +135,8 @@ class Viewer(RBC):
         return self._pyrender_viewer is not None and self._pyrender_viewer.is_active
 
     def setup_camera(self):
-        pos = np.array(self._camera_init_pos)
-        up = np.array(self._camera_up)
-        lookat = np.array(self._camera_init_lookat)
-
         yfov = self._camera_fov / 180.0 * np.pi
-        z = pos - lookat
-        R = gu.z_up_to_R(z, up=up)
-        pose = gu.trans_R_to_T(pos, R)
+        pose = gu.pos_lookat_up_to_T(self._camera_init_pos, self._camera_init_lookat, self._camera_up)
         self._camera_node = self.context.add_node(pyrender.PerspectiveCamera(yfov=yfov), pose=pose)
 
     def update(self, auto_refresh=None):
@@ -169,20 +173,12 @@ class Viewer(RBC):
         """
         if pose is None:
             if pos is None:
-                pos = np.array(self._camera_init_pos)
-            else:
-                pos = np.array(pos)
-
+                pos = self._camera_init_pos
             if lookat is None:
-                lookat = np.array(self._camera_init_lookat)
-            else:
-                lookat = np.array(lookat)
+                lookat = self._camera_init_lookat
+            up = self._camera_up
 
-            up = np.array(self._camera_up)
-
-            z = pos - lookat
-            R = gu.z_up_to_R(z, up=up)
-            pose = gu.trans_R_to_T(pos, R)
+            pose = gu.pos_lookat_up_to_T(pos, lookat, up)
         else:
             if np.array(pose).shape != (4, 4):
                 gs.raise_exception("pose should be a 4x4 matrix.")

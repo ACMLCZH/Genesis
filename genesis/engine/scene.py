@@ -2,6 +2,9 @@ import os
 
 import numpy as np
 import torch
+import pickle
+import time
+import taichi as ti
 
 import genesis as gs
 import genesis.utils.geom as gu
@@ -9,6 +12,7 @@ from genesis.engine.entities.base_entity import Entity
 from genesis.engine.force_fields import ForceField
 from genesis.engine.materials.base import Material
 from genesis.engine.entities import Emitter
+from genesis.engine.states.solvers import SimState
 from genesis.engine.simulator import Simulator
 from genesis.options import (
     AvatarOptions,
@@ -662,13 +666,10 @@ class Scene(RBC):
         # compute offset values for visualizing each env
         if not isinstance(env_spacing, (list, tuple)) or len(env_spacing) != 2:
             gs.raise_exception("`env_spacing` should be a tuple of length 2.")
-        idx_x = np.floor(np.arange(self._B) / self.n_envs_per_row)
-        idx_y = np.arange(self._B) % self.n_envs_per_row
-        idx_z = np.arange(self._B)
-        offset_x = idx_x * self.env_spacing[0]
-        offset_y = idx_y * self.env_spacing[1]
-        offset_z = idx_z * 0.0
-        self.envs_offset = np.vstack([offset_x, offset_y, offset_z]).T
+        offset_x = (np.arange(self._B) // self.n_envs_per_row) * self.env_spacing[0]
+        offset_y = (np.arange(self._B) % self.n_envs_per_row) * self.env_spacing[1]
+        offset_z = np.zeros((self._B,))
+        self.envs_offset = np.stack((offset_x, offset_y, offset_z), axis=-1, dtype=gs.np_float)
 
         # move to center
         if center_envs_at_origin:
@@ -692,23 +693,27 @@ class Scene(RBC):
             self._para_level = gs.PARA_LEVEL.ALL
 
     @gs.assert_built
-    def reset(self, state: dict | None = None, envs_idx=None):
+    def reset(self, state: SimState | None = None, envs_idx=None):
         """
         Resets the scene to its initial state.
 
         Parameters
         ----------
-        state : dict | None
-            The state to reset the scene to. If None, the scene will be reset to its initial state. If this is given, the scene's registerered initial state will be updated to this state.
+        state : SimState | None
+            The state to reset the scene to. If None, the scene will be reset to its initial state.
+            If this is given, the scene's registerered initial state will be updated to this state.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        gs.logger.info(f"Resetting Scene ~~~<{self._uid}>~~~.")
-        self._reset(state, envs_idx)
+        gs.logger.debug(f"Resetting Scene ~~~<{self._uid}>~~~.")
+        self._reset(state, envs_idx=envs_idx)
 
-    def _reset(self, state=None, envs_idx=None):
+    def _reset(self, state: SimState | None = None, *, envs_idx=None):
         if self._is_built:
             if state is None:
                 state = self._init_state
             else:
+                assert isinstance(state, SimState), "state must be a SimState object"
                 self._init_state = state
             self._sim.reset(state, envs_idx)
         else:
@@ -1056,6 +1061,69 @@ class Scene(RBC):
 
         self._backward_ready = False
         self._forward_ready = False
+
+    def dump_ckpt_to_numpy(self) -> dict[str, np.ndarray]:
+        """
+        Collect every Taichi field in the **scene and its active solvers** and
+        return them as a flat ``{key: ndarray}`` dictionary.
+
+        Returns
+        -------
+        dict[str, np.ndarray]
+            Mapping ``"Class.attr[.member]" → array`` with raw field data.
+        """
+        arrays: dict[str, np.ndarray] = {}
+
+        for name, field in self.__dict__.items():
+            if isinstance(field, ti.Field):
+                arrays[".".join((self.__class__.__name__, name))] = field.to_numpy()
+
+        for solver in self.active_solvers:
+            arrays.update(solver.dump_ckpt_to_numpy())
+
+        return arrays
+
+    def save_checkpoint(self, path: str | os.PathLike) -> None:
+        """
+        Pickle the full physics state to *one* file.
+
+        Parameters
+        ----------
+        path : str | os.PathLike
+            Destination filename.
+        """
+        state = {
+            "timestamp": time.time(),
+            "step_index": self.t,
+            "arrays": self.dump_ckpt_to_numpy(),
+        }
+        with open(path, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load_checkpoint(self, path: str | os.PathLike) -> None:
+        """
+        Restore a file produced by :py:meth:`save_checkpoint`.
+
+        Parameters
+        ----------
+        path : str | os.PathLike
+            Path to the checkpoint pickle.
+        """
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+
+        arrays = state["arrays"]
+
+        for name, field in self.__dict__.items():
+            if isinstance(field, ti.Field):
+                key = ".".join((self.__class__.__name__, name))
+                if key in arrays:
+                    field.from_numpy(arrays[key])
+
+        for solver in self.active_solvers:
+            solver.load_ckpt_from_numpy(arrays)
+
+        self._t = state.get("step_index", self._t)
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------

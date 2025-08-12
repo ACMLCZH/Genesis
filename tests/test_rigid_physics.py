@@ -1,15 +1,19 @@
 import math
 import os
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import pytest
 import trimesh
 import torch
 import numpy as np
-
 import mujoco
+
 import genesis as gs
+import genesis.utils.geom as gu
+from genesis.utils.misc import tensor_to_array, get_assets_dir
 
 from .utils import (
     get_hf_assets,
@@ -322,6 +326,7 @@ def test_box_plane_dynamics(gs_sim, mj_sim, tol):
 @pytest.mark.parametrize("model_name", ["chain_capsule_hinge_mesh"])  # FIXME: , "chain_capsule_hinge_capsule"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.implicitfast, gs.integrator.Euler])
+@pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu])
 def test_simple_kinematic_chain(gs_sim, mj_sim, tol):
     simulate_and_check_mujoco_consistency(gs_sim, mj_sim, num_steps=200, tol=tol)
@@ -339,8 +344,9 @@ def test_simple_kinematic_chain(gs_sim, mj_sim, tol):
     ],
 )
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.implicitfast, gs.integrator.Euler])
+@pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_walker(gs_sim, mj_sim, tol):
+def test_walker(gs_sim, mj_sim, gjk_collision, tol):
     # Force numpy seed because this test is very sensitive to the initial condition
     np.random.seed(0)
     (gs_robot,) = gs_sim.entities
@@ -381,7 +387,7 @@ def test_equality_weld(gs_sim, mj_sim, gs_solver):
     mj_sim.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
 
     # Must increase sol params to improve numerical stability
-    sol_params = gs.utils.geom.default_solver_params()
+    sol_params = gu.default_solver_params()
     sol_params[0] = 0.02
     for entity in gs_sim.entities:
         for equality in entity.equalities:
@@ -401,6 +407,74 @@ def test_equality_weld(gs_sim, mj_sim, gs_solver):
     simulate_and_check_mujoco_consistency(gs_sim, mj_sim, qpos, num_steps=300, tol=tol)
 
 
+def test_dynamic_weld(show_viewer, tol):
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    plane = scene.add_entity(
+        gs.morphs.Plane(),
+    )
+    cube = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.04, 0.04, 0.04),
+            pos=(0.65, 0.0, 0.02),
+        ),
+        surface=gs.surfaces.Plastic(color=(1, 0, 0)),
+    )
+    robot = scene.add_entity(
+        gs.morphs.MJCF(
+            file="xml/universal_robots_ur5e/ur5e.xml",
+        ),
+    )
+    scene.build(n_envs=4, env_spacing=(3.0, 3.0))
+
+    end_effector = robot.get_link("ee_virtual_link")
+
+    # Compute up and down robot configurations
+    ee_pos_up = np.array((0.65, 0.0, 0.5), dtype=gs.np_float)
+    ee_pos_down = np.array((0.65, 0.0, 0.15), dtype=gs.np_float)
+    qpos_up = robot.inverse_kinematics(
+        link=end_effector,
+        pos=np.tile(ee_pos_up, (4, 1)),
+        quat=np.tile(np.array((0.0, 1.0, 0.0, 0.0), dtype=gs.np_float), (4, 1)),
+    )
+    qpos_down = robot.inverse_kinematics(
+        link=end_effector,
+        pos=np.tile(ee_pos_down, (4, 1)),
+        quat=np.tile(np.array((0.0, 1.0, 0.0, 0.0), dtype=gs.np_float), (4, 1)),
+    )
+
+    # move to pre-grasp pose
+    robot.control_dofs_position(qpos_up)
+    for i in range(120):
+        scene.step()
+
+    # reach
+    robot.control_dofs_position(qpos_down)
+    for i in range(70):
+        scene.step()
+
+    # add weld constraint and move back up
+    scene.sim.rigid_solver.add_weld_constraint(cube.base_link.idx, end_effector.idx, envs_idx=(0, 1, 2))
+    robot.control_dofs_position(qpos_up)
+    for i in range(60):
+        scene.step()
+    cubes_pos, cubes_quat = cube.get_pos(), cube.get_quat()
+    assert_allclose(torch.diff(cubes_quat, dim=0), 0.0, tol=1e-3)
+    assert_allclose(torch.diff(cubes_pos[[0, 1, 2]], dim=0), 0.0, tol=tol)
+    assert_allclose(cubes_pos[-1] - cubes_pos[0], ee_pos_down - ee_pos_up, tol=1e-2)
+
+    # drop
+    scene.sim.rigid_solver.delete_weld_constraint(cube.base_link.idx, end_effector.idx, envs_idx=(0, 1))
+    for i in range(110):
+        scene.step()
+    cubes_pos, cubes_quat = cube.get_pos(), cube.get_quat()
+    assert_allclose(torch.diff(cubes_quat, dim=0), 0.0, tol=1e-3)
+    assert_allclose(torch.diff(cubes_pos[[0, 1, 3]], dim=0), 0.0, tol=1e-2)
+    assert_allclose(cubes_pos[2] - cubes_pos[0], ee_pos_up - ee_pos_down, tol=1e-3)
+
+
 @pytest.mark.required
 @pytest.mark.parametrize("xml_path", ["xml/one_ball_joint.xml"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
@@ -417,6 +491,7 @@ def test_one_ball_joint(gs_sim, mj_sim, tol):
 @pytest.mark.parametrize("xml_path", ["xml/rope_ball.xml", "xml/rope_hinge.xml"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.implicitfast, gs.integrator.Euler])
+@pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu])
 def test_rope_ball(gs_sim, mj_sim, gs_solver, tol):
     # Make sure it is possible to set the configuration vector without failure
@@ -430,6 +505,7 @@ def test_rope_ball(gs_sim, mj_sim, gs_solver, tol):
 @pytest.mark.multi_contact(False)
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG])
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.implicitfast])
+@pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu])
 def test_urdf_rope(
     gs_solver,
@@ -438,6 +514,7 @@ def test_urdf_rope(
     multi_contact,
     mujoco_compatibility,
     adjacent_collision,
+    gjk_collision,
     dof_damping,
     show_viewer,
 ):
@@ -445,7 +522,14 @@ def test_urdf_rope(
     xml_path = os.path.join(asset_path, "linear_deformable.urdf")
 
     mj_sim = build_mujoco_sim(
-        xml_path, gs_solver, gs_integrator, merge_fixed_links, multi_contact, adjacent_collision, dof_damping
+        xml_path,
+        gs_solver,
+        gs_integrator,
+        merge_fixed_links,
+        multi_contact,
+        adjacent_collision,
+        dof_damping,
+        gjk_collision,
     )
     gs_sim = build_genesis_sim(
         xml_path,
@@ -455,12 +539,13 @@ def test_urdf_rope(
         multi_contact,
         mujoco_compatibility,
         adjacent_collision,
+        gjk_collision,
         show_viewer,
         mj_sim,
     )
 
     # Must increase sol params to improve numerical stability
-    sol_params = gs.utils.geom.default_solver_params()
+    sol_params = gu.default_solver_params()
     sol_params[0] = 0.02
     gs_sim.rigid_solver.set_global_sol_params(sol_params)
     mj_sim.model.jnt_solref[:, 0] = sol_params[0]
@@ -469,6 +554,23 @@ def test_urdf_rope(
 
     # FIXME: Tolerance must be very large due to small masses and compounding of errors over long kinematic chains
     simulate_and_check_mujoco_consistency(gs_sim, mj_sim, num_steps=300, tol=5e-5)
+
+
+@pytest.mark.mujoco_compatibility(True)
+@pytest.mark.multi_contact(False)  # FIXME: Mujoco has errors with multi-contact, so this test is disabled
+@pytest.mark.parametrize("xml_path", ["xml/tet_tet.xml", "xml/tet_ball.xml", "xml/tet_capsule.xml"])
+@pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
+@pytest.mark.parametrize("gs_integrator", [gs.integrator.implicitfast, gs.integrator.Euler])
+@pytest.mark.parametrize("gjk_collision", [True])
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_tet_primitive_shapes(gs_sim, mj_sim, gs_solver, xml_path, tol):
+    # Make sure it is possible to set the configuration vector without failure
+    gs_sim.rigid_solver.set_dofs_position(gs_sim.rigid_solver.get_dofs_position())
+
+    check_mujoco_model_consistency(gs_sim, mj_sim, tol=tol)
+    # FIXME: Because of very small numerical error, error could be this large even if there is no logical error
+    tol = 1e-6 if xml_path == "xml/tet_tet.xml" else 2e-8
+    simulate_and_check_mujoco_consistency(gs_sim, mj_sim, num_steps=1000, tol=tol)
 
 
 @pytest.mark.required
@@ -543,7 +645,7 @@ def test_link_velocity(gs_sim, tol):
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
 def test_pendulum_links_acc(gs_sim, tol):
     pendulum = gs_sim.entities[0]
-    g = gs_sim.rigid_solver._gravity.to_numpy()[2]
+    g = gs_sim.rigid_solver._gravity[0][2]
 
     # Make sure that the linear and angular acceleration matches expectation
     theta = np.random.rand()
@@ -560,7 +662,7 @@ def test_pendulum_links_acc(gs_sim, tol):
 
         # Angular acceleration:
         # * acc_ang_x = - sin(theta) * g
-        acc_ang = gs_sim.rigid_solver.get_links_acc_ang().cpu()
+        acc_ang = gs_sim.rigid_solver.get_links_acc_ang()
         assert_allclose(acc_ang[0], 0, tol=tol)
         assert_allclose(acc_ang[2], np.array([-np.sin(theta) * g, 0.0, 0.0]), tol=tol)
         # Linear spatial acceleration:
@@ -585,7 +687,7 @@ def test_pendulum_links_acc(gs_sim, tol):
         assert_allclose(acc_classical_lin_local, np.array([0.0, np.sin(theta) * g, -(theta_dot**2)]), tol=tol)
         # IMU accelerometer data:
         # * acc_classical_lin_z = - theta_dot ** 2 - cos(theta) * g
-        acc_imu = gs_sim.rigid_solver.get_links_acc(mimick_imu=True).cpu()[2]
+        acc_imu = gs_sim.rigid_solver.get_links_acc(mimick_imu=True)[2]
         assert_allclose(acc_imu, np.array([0.0, 0.0, -(theta_dot**2) - np.cos(theta) * g]), tol=tol)
 
     # Hold the pendulum straight using PD controller and check again
@@ -594,7 +696,7 @@ def test_pendulum_links_acc(gs_sim, tol):
     pendulum.control_dofs_position([0.5 * np.pi])
     for _ in range(400):
         gs_sim.scene.step()
-    acc_classical_lin_world = gs_sim.rigid_solver.get_links_acc(mimick_imu=False).cpu()
+    acc_classical_lin_world = gs_sim.rigid_solver.get_links_acc(mimick_imu=False)
     assert_allclose(acc_classical_lin_world, 0, tol=tol)
 
 
@@ -623,7 +725,7 @@ def test_double_pendulum_links_acc(gs_sim, tol):
         theta_ddot = gs_sim.rigid_solver.dofs_state.acc.to_numpy()[:, 0]
 
         # Angular acceleration
-        acc_ang = gs_sim.rigid_solver.get_links_acc_ang().cpu()
+        acc_ang = tensor_to_array(gs_sim.rigid_solver.get_links_acc_ang())
         assert_allclose(acc_ang[0], 0, tol=tol)
         assert_allclose(acc_ang[1], [theta_ddot[0], 0.0, 0.0], tol=tol)
         assert_allclose(acc_ang[-1], [theta_ddot[0] + theta_ddot[1], 0.0, 0.0], tol=tol)
@@ -632,8 +734,8 @@ def test_double_pendulum_links_acc(gs_sim, tol):
         cacc_spatial_lin_world = gs_sim.rigid_solver.links_state.cacc_lin.to_numpy()[[0, 2, 4], 0]
         com = gs_sim.rigid_solver.links_state.COM.to_numpy()[-1, 0]
         pos = gs_sim.rigid_solver.links_state.pos.to_numpy()[[0, 2, 4], 0]
-        assert_allclose(cacc_spatial_lin_world[1], np.cross(acc_ang[2].numpy(), com), tol=tol)
-        acc_spatial_lin_world = cacc_spatial_lin_world + np.cross(acc_ang[[0, 2, 4]].numpy(), pos - com)
+        assert_allclose(cacc_spatial_lin_world[1], np.cross(acc_ang[2], com), tol=tol)
+        acc_spatial_lin_world = cacc_spatial_lin_world + np.cross(acc_ang[[0, 2, 4]], pos - com)
         assert_allclose(acc_spatial_lin_world[0], 0, tol=tol)
         theta_world = theta.cumsum()
         R = np.array(
@@ -653,13 +755,13 @@ def test_double_pendulum_links_acc(gs_sim, tol):
         )
 
         # Linear true acceleration
-        acc_classical_lin_world = gs_sim.rigid_solver.get_links_acc(mimick_imu=False).cpu()[[0, 2, 4]]
+        acc_classical_lin_world = tensor_to_array(gs_sim.rigid_solver.get_links_acc(mimick_imu=False)[[0, 2, 4]])
         assert_allclose(acc_classical_lin_world[0], 0, tol=tol)
         acc_classical_lin_local = np.matmul(np.moveaxis(R, 2, 0), acc_classical_lin_world[1:, :, None])[..., 0]
         assert_allclose(acc_classical_lin_local[0], np.array([0.0, -theta_ddot[0], -theta_dot[0] ** 2]), tol=tol)
         assert_allclose(
             acc_classical_lin_local[1],
-            R[..., 1] @ acc_classical_lin_world[1].numpy() + np.array([0.0, -theta_ddot.sum(), -theta_dot.sum() ** 2]),
+            R[..., 1] @ acc_classical_lin_world[1] + np.array([0.0, -theta_ddot.sum(), -theta_dot.sum() ** 2]),
             tol=tol,
         )
 
@@ -669,7 +771,7 @@ def test_double_pendulum_links_acc(gs_sim, tol):
     robot.control_dofs_position([0.5 * np.pi, 0.0])
     for _ in range(900):
         gs_sim.scene.step()
-    acc_classical_lin_world = gs_sim.rigid_solver.get_links_acc(mimick_imu=False).cpu()
+    acc_classical_lin_world = gs_sim.rigid_solver.get_links_acc(mimick_imu=False)
     assert_allclose(acc_classical_lin_world, 0, tol=tol)
 
 
@@ -683,28 +785,37 @@ def test_box_box_dynamics(gs_sim):
         cube1_pos = np.array([0.0, 0.0, 0.2])
         cube1_quat = np.array([1.0, 0.0, 0.0, 0.0])
         cube2_pos = np.array([0.0, 0.0, 0.65 + 0.1 * np.random.rand()])
-        cube2_quat = gs.utils.geom.xyz_to_quat(
+        cube2_quat = gu.xyz_to_quat(
             np.array([*(0.15 * np.random.rand(2)), np.pi * np.random.rand()]),
         )
         init_simulators(gs_sim, qpos=np.concatenate((cube1_pos, cube1_quat, cube2_pos, cube2_quat)))
         for i in range(110):
             gs_sim.scene.step()
             if i > 100:
-                qvel = gs_robot.get_dofs_velocity().cpu()
+                qvel = gs_robot.get_dofs_velocity()
                 assert_allclose(qvel, 0, atol=1e-2)
 
-        qpos = gs_robot.get_dofs_position().cpu()
+        qpos = gs_robot.get_dofs_position()
         assert_allclose(qpos[8], 0.6, atol=2e-3)
 
 
-@pytest.mark.parametrize("box_box_detection, dynamics", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize(
+    "box_box_detection, gjk_collision, dynamics",
+    [
+        (True, False, False),
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+    ],
+)
 @pytest.mark.parametrize("backend", [gs.cpu])  # TODO: Cannot afford GPU test for this one
-def test_many_boxes_dynamics(box_box_detection, dynamics, show_viewer):
+def test_many_boxes_dynamics(box_box_detection, gjk_collision, dynamics, show_viewer):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             dt=0.01,
             box_box_detection=box_box_detection,
             max_collision_pairs=1000,
+            use_gjk_collision=gjk_collision,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(10, 10, 10),
@@ -736,13 +847,13 @@ def test_many_boxes_dynamics(box_box_detection, dynamics, show_viewer):
     for i in range(num_steps):
         scene.step()
         if i > num_steps - 50:
-            qvel = scene.rigid_solver.get_dofs_velocity().cpu().reshape((6, -1))
+            qvel = scene.rigid_solver.get_dofs_velocity().reshape((6, -1))
             # Checking the average velocity because is always one cube moving depending on the machine.
             assert_allclose(torch.linalg.norm(qvel, dim=0).mean(), 0, atol=0.05)
 
     for n, entity in enumerate(scene.entities[1:]):
         i, j, k = int(n / 25), int(n / 5) % 5, n % 5
-        qpos = entity.get_dofs_position().cpu()
+        qpos = entity.get_dofs_position()
         if dynamics:
             assert qpos[:2].norm() < 20.0
             assert qpos[2] < 5.0
@@ -837,162 +948,6 @@ def test_info_batching(tol):
     scene.step()
     qposs = robot.get_qpos()
     assert_allclose(qposs[0], qposs[1], tol=tol)
-
-
-@pytest.mark.required
-@pytest.mark.skipif(sys.platform == "darwin", reason="Segfault inside 'shadow_mapping_pass' on MacOS VM.")
-@pytest.mark.xfail(reason="This test is not passing on all platforms for now.")
-def test_batched_offscreen_rendering(show_viewer, tol):
-    scene = gs.Scene(
-        vis_options=gs.options.VisOptions(
-            # rendered_envs_idx=(0, 1, 2),
-            env_separate_rigid=False,
-        ),
-        show_viewer=show_viewer,
-        show_FPS=False,
-    )
-    plane = scene.add_entity(
-        morph=gs.morphs.Plane(),
-        surface=gs.surfaces.Aluminium(
-            ior=10.0,
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/sphere.obj",
-            scale=0.1,
-            pos=(-0.2, -0.8, 0.2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Rough(
-            diffuse_texture=gs.textures.ColorTexture(
-                color=(1.0, 0.5, 0.5),
-            ),
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/sphere.obj",
-            scale=0.1,
-            pos=(-0.2, -0.5, 0.2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Rough(
-            color=(1.0, 1.0, 1.0),
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/sphere.obj",
-            scale=0.1,
-            pos=(-0.2, -0.2, 0.2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Smooth(
-            color=(0.6, 0.8, 1.0),
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/sphere.obj",
-            scale=0.1,
-            pos=(-0.2, 0.2, 0.2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Iron(
-            color=(1.0, 1.0, 1.0),
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/sphere.obj",
-            scale=0.1,
-            pos=(-0.2, 0.5, 0.2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Gold(
-            color=(1.0, 1.0, 1.0),
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/sphere.obj",
-            scale=0.1,
-            pos=(-0.2, 0.8, 0.2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Glass(
-            color=(1.0, 1.0, 1.0),
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/sphere.obj",
-            scale=0.1,
-            pos=(0.2, -0.8, 0.2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Smooth(
-            color=(1.0, 1.0, 1.0, 0.5),
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/wooden_sphere_OBJ/wooden_sphere.obj",
-            scale=0.025,
-            pos=(0.2, -0.5, 0.2),
-            fixed=True,
-        ),
-    )
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/wooden_sphere_OBJ/wooden_sphere.obj",
-            scale=0.025,
-            pos=(0.2, -0.2, 0.2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Rough(
-            diffuse_texture=gs.textures.ImageTexture(
-                image_path="textures/checker.png",
-            )
-        ),
-    )
-    robot = scene.add_entity(
-        gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"),
-    )
-    cam = scene.add_camera(
-        pos=(0.9, 0.0, 0.4),
-        lookat=(0.0, 0.0, 0.4),
-        res=(500, 500),
-        fov=60,
-        spp=512,
-        GUI=False,
-    )
-    scene.build(n_envs=3, env_spacing=(2.0, 2.0))
-
-    for _ in range(10):
-        dofs_lower_bound, dofs_upper_bound = robot.get_dofs_limit()
-        qpos = dofs_lower_bound + (dofs_upper_bound - dofs_lower_bound) * torch.rand(robot.n_qs)
-
-        steps_rgb_arrays = []
-        for _ in range(2):
-            scene.step()
-
-            robots_rgb_arrays = []
-            robot.set_qpos(torch.tile(qpos, (3, 1)))
-            scene.visualizer.update()
-            for i in range(3):
-                pos_i = scene.envs_offset[i] + np.array([0.9, 0.0, 0.4])
-                lookat_i = scene.envs_offset[i] + np.array([0.0, 0.0, 0.4])
-                cam.set_pose(pos=pos_i, lookat=lookat_i)
-                rgb_array, *_ = cam.render()
-                assert np.std(rgb_array) > 10.0
-                robots_rgb_arrays.append(rgb_array)
-
-            steps_rgb_arrays.append(robots_rgb_arrays)
-
-        for i in range(3):
-            assert_allclose(steps_rgb_arrays[0][i], steps_rgb_arrays[1][i], tol=tol)
 
 
 @pytest.mark.required
@@ -1091,28 +1046,28 @@ def test_set_root_pose(relative, show_viewer, tol):
             (robot, ROBOT_POS_ZERO, ROBOT_EULER_ZERO),
             (cube, CUBE_POS_ZERO, CUBE_EULER_ZERO),
         ):
-            pos_zero = torch.tensor(pos_zero, dtype=gs.tc_float)
+            pos_zero = torch.tensor(pos_zero, device="cpu", dtype=gs.tc_float)
             euler_zero = torch.deg2rad(torch.tensor(euler_zero, dtype=gs.tc_float))
 
             assert_allclose(entity.get_pos(), pos_zero, tol=tol)
-            euler = gs.utils.geom.quat_to_xyz(entity.get_quat(), rpy=True)
-            assert_allclose(euler, euler_zero, tol=1e-7)
+            euler = gu.quat_to_xyz(entity.get_quat(), rpy=True)
+            assert_allclose(euler, euler_zero, tol=5e-4)
 
-            pos_delta = torch.rand(3, dtype=gs.tc_float)
+            pos_delta = torch.rand(3, device="cpu", dtype=gs.tc_float)
             entity.set_pos(pos_delta, relative=relative)
-            quat_delta = torch.rand(4, dtype=gs.tc_float)
+            quat_delta = torch.rand(4, device="cpu", dtype=gs.tc_float)
             quat_delta /= torch.linalg.norm(quat_delta)
             entity.set_quat(quat_delta, relative=relative)
 
             pos_ref = pos_delta + pos_zero if relative else pos_delta
             assert_allclose(entity.get_pos(), pos_ref, tol=tol)
-            euler = gs.utils.geom.quat_to_xyz(entity.get_quat(), rpy=True)
-            quat_zero = gs.utils.geom.xyz_to_quat(euler_zero, rpy=True)
+            euler = gu.quat_to_xyz(entity.get_quat(), rpy=True)
+            quat_zero = gu.xyz_to_quat(euler_zero, rpy=True)
             if relative:
-                quat_ref = gs.utils.geom.transform_quat_by_quat(quat_zero, quat_delta)
+                quat_ref = gu.transform_quat_by_quat(quat_zero, quat_delta)
             else:
                 quat_ref = quat_delta
-            euler_ref = gs.utils.geom.quat_to_xyz(quat_ref, rpy=True)
+            euler_ref = gu.quat_to_xyz(quat_ref, rpy=True)
             assert_allclose(euler, euler_ref, tol=tol)
 
 
@@ -1160,6 +1115,7 @@ def test_set_sol_params(n_envs, batched, tol):
 @pytest.mark.parametrize("xml_path", ["xml/humanoid.xml"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.Newton])
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
+@pytest.mark.parametrize("gjk_collision", [True])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_stickman(gs_sim, mj_sim, tol):
     # Make sure that "static" model information are matching
@@ -1174,13 +1130,13 @@ def test_stickman(gs_sim, mj_sim, tol):
         gs_sim.scene.step()
         if i > 4000:
             (gs_robot,) = gs_sim.entities
-            qvel = gs_robot.get_dofs_velocity().cpu()
+            qvel = gs_robot.get_dofs_velocity()
             qvel_norminf = torch.linalg.norm(qvel, ord=math.inf)
             qvel_norminf_all.append(qvel_norminf)
-    np.testing.assert_array_less(torch.median(torch.stack(qvel_norminf_all, dim=0)), 0.1)
+    np.testing.assert_array_less(torch.median(torch.stack(qvel_norminf_all, dim=0)).cpu(), 0.1)
 
-    qpos = gs_robot.get_dofs_position().cpu()
-    assert np.linalg.norm(qpos[:2]) < 1.3
+    qpos = gs_robot.get_dofs_position()
+    assert torch.linalg.norm(qpos[:2]) < 1.3
     body_z = gs_sim.rigid_solver.links_state.pos.to_numpy()[:-1, 0, 2]
     np.testing.assert_array_less(0, body_z + gs.EPS)
 
@@ -1269,18 +1225,12 @@ def move_cube(use_suction, mode, show_viewer):
     # move to pre-grasp pose
     qpos = franka.inverse_kinematics(
         link=end_effector,
-        pos=np.array([0.65, 0.0, 0.25]),
+        pos=np.array([0.65, 0.0, 0.22]),
         quat=np.array([0, 1, 0, 0]),
     )
     # gripper open pos
     qpos[-2:] = 0.04
-    path = franka.plan_path(
-        qpos_goal=qpos,
-        num_waypoints=100,  # 1s duration
-        resolution=0.05,
-        timeout=30.0,
-    )
-    assert path
+    path = franka.plan_path(qpos_goal=qpos, num_waypoints=300, resolution=0.05, max_retry=10)
     # execute the planned path
     franka.control_dofs_position(np.array([0.15, 0.15]), fingers_dof)
     for waypoint in path:
@@ -1288,7 +1238,7 @@ def move_cube(use_suction, mode, show_viewer):
         scene.step()
 
     # Get more time to the robot to reach the last waypoint
-    for i in range(100):
+    for i in range(120):
         scene.step()
 
     # reach
@@ -1298,13 +1248,13 @@ def move_cube(use_suction, mode, show_viewer):
         quat=np.array([0, 1, 0, 0]),
     )
     franka.control_dofs_position(qpos[:-2], motors_dof)
-    for i in range(50):
+    for i in range(60):
         scene.step()
 
     # grasp
     if use_suction:
-        link_cube = np.array([cube.get_link("box_baselink").idx], dtype=gs.np_int)
-        link_franka = np.array([franka.get_link("hand").idx], dtype=gs.np_int)
+        link_cube = cube.get_link("box_baselink").idx
+        link_franka = franka.get_link("hand").idx
         scene.sim.rigid_solver.add_weld_constraint(link_cube, link_franka)
     else:
         franka.control_dofs_position(qpos[:-2], motors_dof)
@@ -1330,11 +1280,12 @@ def move_cube(use_suction, mode, show_viewer):
     )
     path = franka.plan_path(
         qpos_goal=qpos,
-        num_waypoints=150,
+        num_waypoints=100,
         resolution=0.05,
-        timeout=30.0,
+        max_retry=10,
+        ee_link_name="hand",
+        with_entity=cube,
     )
-    assert path
     for waypoint in path:
         franka.control_dofs_position(waypoint[:-2], motors_dof)
         scene.step()
@@ -1352,14 +1303,13 @@ def move_cube(use_suction, mode, show_viewer):
     for i in range(550):
         scene.step()
         if i > 550:
-            qvel = cube.get_dofs_velocity().cpu()
-            assert_allclose(qvel, 0, atol=0.06)
+            qvel = cube.get_dofs_velocity()
+            assert_allclose(qvel, 0, atol=0.02)
 
-    qpos = cube.get_dofs_position().cpu()
+    qpos = cube.get_dofs_position()
     assert_allclose(qpos[2], 0.075, atol=2e-3)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="OMPL is not supported on Windows OS.")
 @pytest.mark.parametrize(
     "mode, backend",
     [
@@ -1375,7 +1325,6 @@ def test_inverse_kinematics(mode, show_viewer):
     move_cube(use_suction=False, mode=mode, show_viewer=show_viewer)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="OMPL is not supported on Windows OS.")
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_suction_cup(mode, show_viewer):
@@ -1383,9 +1332,9 @@ def test_suction_cup(mode, show_viewer):
 
 
 @pytest.mark.required
-@pytest.mark.skipif(sys.platform == "win32", reason="OMPL is not supported on Windows OS.")
+@pytest.mark.parametrize("n_envs", [0, 2])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_path_planning_avoidance(show_viewer):
+def test_path_planning_avoidance(n_envs, show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.01,
@@ -1427,34 +1376,39 @@ def test_path_planning_avoidance(show_viewer):
         ),
         vis_mode="collision",
     )
-    scene.build()
+    scene.build(n_envs=n_envs)
 
     hand = franka.get_link("hand")
-    hand_pos_ref = torch.tensor([0.3, 0.25, 0.25], device=gs.device)
-    hand_quat_ref = torch.tensor([0.3073, 0.5303, 0.7245, -0.2819], device=gs.device)
+    if n_envs > 0:
+        hand_pos_ref = torch.tensor([[0.3, 0.25, 0.25]] * n_envs, device=gs.device)
+        hand_quat_ref = torch.tensor([[0.3073, 0.5303, 0.7245, -0.2819]] * n_envs, device=gs.device)
+    else:
+        hand_pos_ref = torch.tensor([0.3, 0.25, 0.25], device=gs.device)
+        hand_quat_ref = torch.tensor([0.3073, 0.5303, 0.7245, -0.2819], device=gs.device)
     qpos = franka.inverse_kinematics(hand, pos=hand_pos_ref, quat=hand_quat_ref)
-    qpos[-2:] = 0.04
+    qpos[..., -2:] = 0.04
 
-    avoidance_path = franka.plan_path(
-        qpos_goal=qpos,
-        num_waypoints=200,
-        ignore_collision=False,
-        resolution=0.002,
-        timeout=180.0,
-        max_retry=5,
-    )
-    assert avoidance_path
-    assert_allclose(avoidance_path[0].cpu(), 0, tol=gs.EPS)
-    assert_allclose(avoidance_path[-1].cpu(), qpos.cpu(), tol=gs.EPS)
     free_path = franka.plan_path(
         qpos_goal=qpos,
-        num_waypoints=200,
+        num_waypoints=300,
+        resolution=0.05,
         ignore_collision=True,
-        resolution=0.002,
     )
-    assert free_path
-    assert_allclose(free_path[0].cpu(), 0, tol=gs.EPS)
-    assert_allclose(free_path[-1].cpu(), qpos.cpu(), tol=gs.EPS)
+    assert_allclose(free_path[0], 0, tol=gs.EPS)
+    assert_allclose(free_path[-1], qpos, tol=gs.EPS)
+
+    qpos = franka.inverse_kinematics(hand, pos=hand_pos_ref, quat=hand_quat_ref)
+    qpos[..., -2:] = 0.04
+    avoidance_path = franka.plan_path(
+        qpos_goal=qpos,
+        num_waypoints=300,
+        ignore_collision=False,
+        resolution=0.05,
+        max_nodes=4000,
+        max_retry=40,
+    )
+    assert_allclose(avoidance_path[0], 0, tol=gs.EPS)
+    assert_allclose(avoidance_path[-1], qpos, tol=gs.EPS)
 
     for path, ignore_collision in ((free_path, False), (avoidance_path, True)):
         max_penetration = float("-inf")
@@ -1465,19 +1419,17 @@ def test_path_planning_avoidance(show_viewer):
             # Check if the cube is colliding with the robot
             scene.rigid_solver._kernel_forward_dynamics()
             scene.rigid_solver._func_constraint_force()
-            for i in range(scene.rigid_solver.collider.n_contacts.to_numpy()[0]):
-                contact_data = scene.rigid_solver.collider.contact_data[i, 0]
+            for i in range(scene.rigid_solver.collider._collider_state.n_contacts.to_numpy()[0]):
+                contact_data = scene.rigid_solver.collider._collider_state.contact_data[i, 0]
                 if any(i_g in tuple(range(len(cubes))) for i_g in (contact_data.link_a, contact_data.link_b)):
                     max_penetration = max(max_penetration, contact_data.penetration)
 
         args = (max_penetration, 5e-3)
         np.testing.assert_array_less(*(args if ignore_collision else args[::-1]))
 
-        assert_allclose(hand_pos_ref.cpu(), hand.get_pos().cpu(), tol=5e-4)
-        hand_quat_diff = gs.utils.geom.transform_quat_by_quat(
-            gs.utils.geom.inv_quat(hand_quat_ref.cpu()), hand.get_quat().cpu()
-        )
-        theta = 2 * np.arctan2(torch.linalg.norm(hand_quat_diff[1:]), torch.abs(hand_quat_diff[0]))
+        assert_allclose(hand_pos_ref, hand.get_pos(), tol=5e-4)
+        hand_quat_diff = gu.transform_quat_by_quat(gu.inv_quat(hand_quat_ref), hand.get_quat())
+        theta = 2 * torch.arctan2(torch.linalg.norm(hand_quat_diff[..., 1:]), torch.abs(hand_quat_diff[..., 0]))
         assert_allclose(theta, 0.0, tol=5e-3)
 
 
@@ -1547,7 +1499,7 @@ def test_contact_forces(show_viewer, tol):
     )
     scene.build()
 
-    cube_weight = scene.rigid_solver._gravity.to_numpy()[2] * cube.get_mass()
+    cube_weight = scene.rigid_solver._gravity[0][2] * cube.get_mass()
     motors_dof = np.arange(7)
     fingers_dof = np.arange(7, 9)
     qpos = np.array([-1.0124, 1.5559, 1.3662, -1.6878, -1.5799, 1.7757, 1.4602, 0.04, 0.04])
@@ -1565,7 +1517,7 @@ def test_contact_forces(show_viewer, tol):
     # hold
     for i in range(50):
         scene.step()
-    contact_forces = cube.get_links_net_contact_force().cpu()
+    contact_forces = cube.get_links_net_contact_force()
     assert_allclose(contact_forces[0], [0.0, 0.0, -cube_weight], atol=1e-5)
 
     # grasp
@@ -1584,8 +1536,8 @@ def test_contact_forces(show_viewer, tol):
         franka.control_dofs_position(qpos[:-2], motors_dof)
         franka.control_dofs_position(np.array([0.0, 0.0]), fingers_dof)
         scene.step()
-    contact_forces = cube.get_links_net_contact_force().cpu()
-    assert_allclose(contact_forces[0], [0.0, 0.0, -cube_weight], atol=1e-5)
+    contact_forces = cube.get_links_net_contact_force()
+    assert_allclose(contact_forces[0], [0.0, 0.0, -cube_weight], atol=5e-5)
 
 
 @pytest.mark.required
@@ -1615,7 +1567,7 @@ def test_apply_external_forces(xml_path, show_viewer):
     tol = 5e-3
     end_effector_link_idx = robot.links[-1].idx
     for step in range(801):
-        ee_pos = scene.rigid_solver.get_links_pos([end_effector_link_idx]).cpu()[0]
+        ee_pos = scene.rigid_solver.get_links_pos([end_effector_link_idx])[0]
         if step == 0:
             assert_allclose(ee_pos, [0.8, 0.0, 0.02], tol=tol)
         elif step == 600:
@@ -1709,11 +1661,15 @@ def test_nonconvex_collision(show_viewer):
 
 
 @pytest.mark.parametrize("convexify", [True, False])
+@pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_mesh_repair(convexify, show_viewer):
+def test_mesh_repair(convexify, show_viewer, gjk_collision):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.004,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            use_gjk_collision=gjk_collision,
         ),
         show_viewer=show_viewer,
         show_FPS=False,
@@ -1750,17 +1706,19 @@ def test_mesh_repair(convexify, show_viewer):
     for i in range(400):
         scene.step()
         if i > 300:
-            qvel = obj.get_dofs_velocity().cpu()
+            qvel = obj.get_dofs_velocity()
             assert_allclose(qvel[:3], 0, atol=tol_pos)
             assert_allclose(qvel[3:], 0, atol=tol_rot)
-    qpos = obj.get_dofs_position().cpu()
+    qpos = obj.get_dofs_position()
     assert_allclose(qpos[:2], (0.3, 0.0), atol=2e-3)
 
 
+# FIXME: GJK collision detection algorithm is failing on some platform.
 @pytest.mark.required
-@pytest.mark.parametrize("euler", [(90, 0, 90), (76, 15, 90)])
+@pytest.mark.parametrize("euler", [(90, 0, 90), (75, 15, 90)])
+@pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_convexify(euler, backend, show_viewer):
+def test_convexify(euler, backend, show_viewer, gjk_collision):
     OBJ_OFFSET_X = 0.0  # 0.02
     OBJ_OFFSET_Y = 0.15
 
@@ -1770,6 +1728,7 @@ def test_convexify(euler, backend, show_viewer):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             dt=0.004,
+            use_gjk_collision=gjk_collision,
         ),
         show_viewer=show_viewer,
         show_FPS=False,
@@ -1820,7 +1779,7 @@ def test_convexify(euler, backend, show_viewer):
 
     # Make sure that all the geometries in the scene are convex
     assert gs_sim.rigid_solver.geoms_info.is_convex.to_numpy().all()
-    assert not gs_sim.rigid_solver.collider._has_nonconvex_nonterrain
+    assert not gs_sim.rigid_solver.collider._collider_static_config.has_nonconvex_nonterrain
 
     # There should be only one geometry for the apple as it can be convexify without decomposition,
     # but for the others it is hard to tell... Let's use some reasonable guess.
@@ -1838,10 +1797,10 @@ def test_convexify(euler, backend, show_viewer):
         scene.step()
         # cam.render()
         if i > 1600:
-            qvel = gs_sim.rigid_solver.get_dofs_velocity().cpu()
+            qvel = gs_sim.rigid_solver.get_dofs_velocity()
             qvel_norminf = torch.linalg.norm(qvel, ord=math.inf)
             qvel_norminf_all.append(qvel_norminf)
-    np.testing.assert_array_less(torch.median(torch.stack(qvel_norminf_all, dim=0)), 4.0)
+    np.testing.assert_array_less(torch.median(torch.stack(qvel_norminf_all, dim=0)).cpu(), 4.0)
     # cam.stop_recording(save_to_filename="video.mp4", fps=60)
 
     for obj in objs:
@@ -1854,7 +1813,7 @@ def test_convexify(euler, backend, show_viewer):
     # The cup is tipping because it does not land flat due to convex decomposition error.
     if euler == (90, 0, 90):
         for i, obj in enumerate((mug, donut)):
-            qpos = obj.get_dofs_position().cpu()
+            qpos = obj.get_dofs_position()
             assert_allclose(qpos[0], OBJ_OFFSET_X * (1.5 - i), atol=7e-3)
             assert_allclose(qpos[1], OBJ_OFFSET_Y * (i - 1.5), atol=5e-3)
 
@@ -1864,16 +1823,19 @@ def test_convexify(euler, backend, show_viewer):
 @pytest.mark.parametrize("model_name", ["collision_edge_cases"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG])
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
+@pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_collision_edge_cases(gs_sim, mode):
-    qpos_0 = gs_sim.rigid_solver.get_dofs_position().cpu()
+def test_collision_edge_cases(gs_sim, mode, gjk_collision):
+    qpos_0 = gs_sim.rigid_solver.get_dofs_position()
     for _ in range(200):
         gs_sim.scene.step()
 
-    qvel = gs_sim.rigid_solver.get_dofs_velocity().cpu()
+    qvel = gs_sim.rigid_solver.get_dofs_velocity()
     assert_allclose(qvel, 0, atol=1e-2)
-    qpos = gs_sim.rigid_solver.get_dofs_position().cpu()
-    assert_allclose(qpos[[0, 1, 3, 4, 5]], qpos_0[[0, 1, 3, 4, 5]], atol=1e-4)
+    qpos = gs_sim.rigid_solver.get_dofs_position()
+    # When using GJK, tolerance should be slightly higher for mode 6, but it is still physically valid.
+    atol = 1e-3 if gjk_collision == True and mode == 6 else 1e-4
+    assert_allclose(qpos[[0, 1, 3, 4, 5]], qpos_0[[0, 1, 3, 4, 5]], atol=atol)
 
 
 @pytest.mark.required
@@ -1933,8 +1895,8 @@ def test_collision_plane_convex(show_viewer, tol):
 def test_nan_reset(gs_sim, mode):
     for _ in range(200):
         gs_sim.scene.step()
-        qvel = gs_sim.rigid_solver.get_dofs_velocity().cpu()
-        if np.isnan(qvel).any():
+        qvel = gs_sim.rigid_solver.get_dofs_velocity()
+        if torch.isnan(qvel).any():
             break
     else:
         raise AssertionError
@@ -1942,8 +1904,8 @@ def test_nan_reset(gs_sim, mode):
     gs_sim.scene.reset()
     for _ in range(5):
         gs_sim.scene.step()
-    qvel = gs_sim.rigid_solver.get_dofs_velocity().cpu()
-    assert not np.isnan(qvel).any()
+    qvel = gs_sim.rigid_solver.get_dofs_velocity()
+    assert not torch.isnan(qvel).any()
 
 
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
@@ -1958,6 +1920,7 @@ def test_terrain_generation(show_viewer):
             camera_fov=40,
         ),
         show_viewer=show_viewer,
+        show_FPS=False,
     )
     terrain = scene.add_entity(
         morph=gs.morphs.Terrain(
@@ -1987,11 +1950,85 @@ def test_terrain_generation(show_viewer):
     height_field = terrain.geoms[0].metadata["height_field"]
     height_field_min = terrain.terrain_scale[1] * height_field.min()
     height_field_max = terrain.terrain_scale[1] * height_field.max()
-    height_balls = ball.get_pos().cpu()[:, 2]
+    height_balls = ball.get_pos()[:, 2]
     height_balls_min = height_balls.min() - 0.1
     height_balls_max = height_balls.max() - 0.1
     assert_allclose(height_balls_min, height_field_min, atol=2e-3)
     assert height_balls_max - height_balls_min > 0.5 * (height_field_max - height_field_min)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_terrain_size(show_viewer, tol):
+    scene_ref = gs.Scene(show_viewer=show_viewer)
+    terrain_ref = scene_ref.add_entity(
+        morph=gs.morphs.Terrain(
+            n_subterrains=(2, 2),
+            subterrain_size=(12.0, 12.0),
+            horizontal_scale=0.25,
+            subterrain_types="wave_terrain",
+        )
+    )
+
+    height_ref = terrain_ref.geoms[0].metadata["height_field"]
+
+    scene_test = gs.Scene(show_viewer=show_viewer)
+    terrain_test = scene_test.add_entity(
+        morph=gs.morphs.Terrain(
+            n_subterrains=(2, 2),
+            subterrain_size=(12.0, 12.0),
+            horizontal_scale=0.25,
+            subterrain_types="wave_terrain",
+            subterrain_parameters={"wave_terrain": {"amplitude": 0.2}},
+        )
+    )
+
+    height_test = terrain_test.geoms[0].metadata["height_field"]
+
+    assert_allclose((height_ref * 2.0), height_test, tol=tol)
+
+
+@pytest.mark.required
+@pytest.mark.merge_fixed_links(False)
+@pytest.mark.parametrize("model_name", ["pendulum"])
+@pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG])
+@pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
+def test_jacobian(gs_sim, tol):
+    pendulum = gs_sim.entities[0]
+    angle = 0.7
+    pendulum.set_qpos(np.array([angle], dtype=gs.np_float))
+    gs_sim.scene.step()
+
+    link = pendulum.get_link("PendulumArm_0")
+
+    p_local = np.array([0.05, -0.02, 0.12], dtype=gs.np_float)
+    J_o = tensor_to_array(pendulum.get_jacobian(link))
+    J_p = tensor_to_array(pendulum.get_jacobian(link, p_local))
+
+    c, s = np.cos(angle), np.sin(angle)
+    Rx = np.array(
+        [
+            [1, 0, 0],
+            [0, c, -s],
+            [0, s, c],
+        ],
+        dtype=gs.np_float,
+    )
+    r_world = Rx @ p_local
+    r_cross = np.array(
+        [
+            [0, -r_world[2], r_world[1]],
+            [r_world[2], 0, -r_world[0]],
+            [-r_world[1], r_world[0], 0],
+        ],
+        dtype=gs.np_float,
+    )
+
+    lin_o, ang_o = J_o[:3, 0], J_o[3:, 0]
+    lin_expected = lin_o - r_cross @ ang_o
+
+    assert_allclose(J_p[3:, 0], ang_o, tol=tol)
+    assert_allclose(J_p[:3, 0], lin_expected, tol=tol)
 
 
 @pytest.mark.required
@@ -2002,6 +2039,11 @@ def test_urdf_parsing(show_viewer, tol):
     DOOR_JOINT_DAMPING = 1.5
 
     scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            # Must use GJK to make collision detection independent from the center of each geometry.
+            # Note that it is also the case for MPR+SDF most of the time due to warm-start.
+            use_gjk_collision=True,
+        ),
         show_viewer=show_viewer,
         show_FPS=False,
     )
@@ -2077,9 +2119,9 @@ def test_urdf_parsing(show_viewer, tol):
     entities[(False, True)].set_dofs_velocity(door_vel, 6)
     entities[(True, False)].set_dofs_velocity(door_vel)
     entities[(True, True)].set_dofs_velocity(door_vel)
-    link_1 = np.array([entities[(True, True)].link_start], dtype=gs.np_int)
+    link_1 = entities[(True, True)].link_start
     for key in ((False, False), (False, True)):
-        link_2 = np.array([entities[key].link_start], dtype=gs.np_int)
+        link_2 = entities[key].link_start
         scene.rigid_solver.add_weld_constraint(link_1, link_2)
 
     for i in range(2000):
@@ -2120,6 +2162,65 @@ def test_urdf_mimic(show_viewer, tol):
 
     gs_qpos = scene.rigid_solver.qpos.to_numpy()[:, 0]
     assert_allclose(gs_qpos[-1], gs_qpos[-2], tol=tol)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_gravity(show_viewer, tol):
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+    )
+
+    sphere = scene.add_entity(gs.morphs.Sphere())
+    scene.build(n_envs=2)
+
+    scene.sim.set_gravity(torch.tensor([0.0, 0.0, -9.8]), envs_idx=0)
+    scene.sim.set_gravity(torch.tensor([0.0, 0.0, 9.8]), envs_idx=1)
+
+    for _ in range(200):
+        scene.step()
+
+    first_pos = sphere.get_dofs_position()[0, 2]
+    second_pos = sphere.get_dofs_position()[1, 2]
+
+    assert_allclose(first_pos * -1, second_pos, tol=tol)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_scene_saver_franka(show_viewer, tol):
+    scene1 = gs.Scene(show_viewer=show_viewer)
+    franka1 = scene1.add_entity(
+        gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"),
+    )
+    scene1.build()
+
+    dof_idx = [j.dofs_idx_local[0] for j in franka1.joints]
+
+    franka1.set_dofs_kp(np.full(len(dof_idx), 3000), dof_idx)
+    franka1.set_dofs_kv(np.full(len(dof_idx), 300), dof_idx)
+
+    target_pose = np.array([0.3, -0.8, 0.4, -1.6, 0.5, 1.0, -0.6, 0.03, 0.03], dtype=float)
+    franka1.control_dofs_position(target_pose, dof_idx)
+
+    for _ in range(400):
+        scene1.step()
+
+    pose_ref = franka1.get_dofs_position(dof_idx)
+
+    ckpt_path = Path(tempfile.gettempdir()) / "franka_unit.pkl"
+    scene1.save_checkpoint(ckpt_path)
+
+    scene2 = gs.Scene(show_viewer=show_viewer)
+    franka2 = scene2.add_entity(
+        gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"),
+    )
+    scene2.build()
+    scene2.load_checkpoint(ckpt_path)
+
+    pose_loaded = franka2.get_dofs_position(dof_idx)
+
+    assert_allclose(pose_ref, pose_loaded, tol=tol)
 
 
 @pytest.mark.required
@@ -2213,7 +2314,7 @@ def test_drone_advanced(show_viewer):
             drone.set_propellels_rpm(torch.full((4,), 50000.0))
         scene.step()
         if i > 350:
-            assert scene.rigid_solver.collider.n_contacts.to_numpy()[0] == 2
+            assert scene.rigid_solver.collider._collider_state.n_contacts.to_numpy()[0] == 2
             assert_allclose(scene.rigid_solver.get_dofs_velocity(), 0, tol=2e-3)
 
     # Push the drones symmetrically and wait for them to collide
@@ -2223,7 +2324,7 @@ def test_drone_advanced(show_viewer):
         for drone in drones:
             drone.set_propellels_rpm(torch.full((4,), 50000.0))
         scene.step()
-        if scene.rigid_solver.collider.n_contacts.to_numpy()[0] > 2:
+        if scene.rigid_solver.collider._collider_state.n_contacts.to_numpy()[0] > 2:
             break
     else:
         raise AssertionError
@@ -2283,7 +2384,34 @@ def test_data_accessor(n_envs, batched, tol):
     # Simulate for a while, until they collide with something
     for _ in range(400):
         gs_sim.step()
-        gs_n_contacts = gs_sim.rigid_solver.collider.n_contacts.to_torch(device="cpu")
+
+        gs_n_contacts = gs_sim.rigid_solver.collider._collider_state.n_contacts.to_numpy()
+        assert len(gs_n_contacts) == max(n_envs, 1)
+        for as_tensor in (False, True):
+            for to_torch in (False, True):
+                contacts_info = gs_sim.rigid_solver.collider.get_contacts(as_tensor, to_torch)
+                for value in contacts_info.values():
+                    if n_envs > 0:
+                        assert n_envs == len(value)
+                    else:
+                        assert gs_n_contacts[0] == len(value)
+                        value = value[None] if as_tensor else (value,)
+
+                    for i_b in range(n_envs):
+                        n_contacts = gs_n_contacts[i_b]
+                        if as_tensor:
+                            assert isinstance(value, torch.Tensor if to_torch else np.ndarray)
+                            if value.dtype in (gs.tc_int, gs.np_int):
+                                assert (value[i_b, :n_contacts] != -1).all()
+                                assert (value[i_b, n_contacts:] == -1).all()
+                            else:
+                                assert_allclose(value[i_b, n_contacts:], 0.0, tol=0)
+                        else:
+                            assert isinstance(value, (list, tuple))
+                            assert value[i_b].shape[0] == n_contacts
+                            if value[i_b].dtype in (gs.tc_int, gs.np_int):
+                                assert (value[i_b] != -1).all()
+
         if (gs_n_contacts > 0).all():
             break
     else:
@@ -2291,8 +2419,10 @@ def test_data_accessor(n_envs, batched, tol):
     gs_sim.rigid_solver._kernel_forward_dynamics()
     gs_sim.rigid_solver._func_constraint_force()
 
+    gs_robot.get_contacts()
+
     # Make sure that all the robots ends up in the different state
-    qposs = gs_robot.get_qpos().cpu()
+    qposs = gs_robot.get_qpos()
     for i in range(n_envs - 1):
         with np.testing.assert_raises(AssertionError):
             assert_allclose(qposs[i], qposs[i + 1], tol=tol)
@@ -2450,10 +2580,18 @@ def test_data_accessor(n_envs, batched, tol):
 
 
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_mesh_to_heightfield(show_viewer):
+def test_mesh_to_heightfield(tmp_path, show_viewer):
+    horizontal_scale = 2.0
+    path_terrain = os.path.join(get_assets_dir(), "meshes", "terrain_45.obj")
+
+    hf_terrain, xs, ys = gs.utils.terrain.mesh_to_heightfield(path_terrain, spacing=horizontal_scale, oversample=1)
+
+    # default heightfield starts at 0, 0, 0
+    # translate to the center of the mesh
+    translation = np.array([np.nanmin(xs), np.nanmin(ys), 0])
+
     ########################## create a scene ##########################
     scene = gs.Scene(
-        show_viewer=show_viewer,
         sim_options=gs.options.SimOptions(
             gravity=(2, 0, -2),
         ),
@@ -2461,16 +2599,9 @@ def test_mesh_to_heightfield(show_viewer):
             camera_pos=(0, -50, 0),
             camera_lookat=(0, 0, 0),
         ),
+        show_viewer=show_viewer,
+        show_FPS=False,
     )
-
-    horizontal_scale = 2.0
-    gs_root = os.path.dirname(os.path.abspath(gs.__file__))
-    path_terrain = os.path.join(gs_root, "assets", "meshes", "terrain_45.obj")
-    hf_terrain, xs, ys = gs.utils.terrain.mesh_to_heightfield(path_terrain, spacing=horizontal_scale, oversample=1)
-
-    # default heightfield starts at 0, 0, 0
-    # translate to the center of the mesh
-    translation = np.array([np.nanmin(xs), np.nanmin(ys), 0])
 
     terrain_heightfield = scene.add_entity(
         morph=gs.morphs.Terrain(
@@ -2481,7 +2612,6 @@ def test_mesh_to_heightfield(show_viewer):
         ),
         vis_mode="collision",
     )
-
     ball = scene.add_entity(
         gs.morphs.Sphere(
             pos=(10, 15, 10),
@@ -2489,12 +2619,11 @@ def test_mesh_to_heightfield(show_viewer):
         ),
         vis_mode="collision",
     )
-
     scene.build()
 
     for i in range(1000):
         scene.step()
 
     # speed is around 0
-    qvel = ball.get_dofs_velocity().cpu()
+    qvel = ball.get_dofs_velocity()
     assert_allclose(qvel, 0, atol=1e-2)

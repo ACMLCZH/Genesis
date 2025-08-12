@@ -1,4 +1,4 @@
-# import taichi while suppressing its output
+import io
 import os
 import sys
 import site
@@ -6,17 +6,14 @@ import atexit
 import logging as _logging
 import traceback
 from platform import system
-from unittest.mock import patch
+from contextlib import redirect_stdout
 
-_ti_outputs = []
+# Import taichi while collecting its output without printing directly
+_ti_outputs = io.StringIO()
 
+os.environ.setdefault("TI_ENABLE_PYBUF", "0" if sys.stdout is sys.__stdout__ else "1")
 
-def fake_print(*args, **kwargs):
-    output = "".join(args)
-    _ti_outputs.append(output)
-
-
-with patch("builtins.print", fake_print):
+with redirect_stdout(_ti_outputs):
     import taichi as ti
 
 try:
@@ -31,7 +28,11 @@ from .constants import GS_ARCH, TI_ARCH
 from .constants import backend as gs_backend
 from .logging import Logger
 from .version import __version__
-from .utils import redirect_libc_stderr, set_random_seed, get_platform, get_device
+from .utils import redirect_libc_stderr, set_random_seed, get_platform, get_device, get_cache_dir
+
+
+os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(get_cache_dir(), "numba"))
+
 
 _initialized = False
 backend = None
@@ -49,12 +50,11 @@ def init(
     backend=None,
     theme="dark",
     logger_verbose_time=False,
+    performance_mode: bool = False,  # True: compilation up to 6x slower (GJK), but runs ~1-5% faster
 ):
-    # Consider Genesis as initialized right away
     global _initialized
     if _initialized:
         raise_exception("Genesis already initialized.")
-    _initialized = True
 
     # genesis._theme
     global _theme
@@ -122,6 +122,15 @@ def init(
     np_int = np.int32
     tc_int = torch.int32
 
+    # Bool
+    # Note that `ti.u1` is broken on Apple Metal and output garbage.
+    global ti_bool
+    global np_bool
+    global tc_bool
+    ti_bool = ti.u1 if backend != gs_backend.metal else ti.i32
+    np_bool = np.bool_
+    tc_bool = torch.bool
+
     # let's use GLSL convention: https://learnwebgl.brown37.net/12_shader_language/glsl_data_types.html
     global ti_vec2
     ti_vec2 = ti.types.vector(2, ti_float)
@@ -171,6 +180,12 @@ def init(
         torch.backends.cudnn.benchmark = False
         logger.info("Beware running Genesis in debug mode dramatically reduces runtime speed.")
 
+    if not performance_mode:
+        logger.info(
+            "Consider setting 'performance_mode=True' in production to maximise runtime speed, if significantly "
+            "increasing compilation time is not a concern."
+        )
+
     if seed is not None:
         global SEED
         SEED = seed
@@ -185,7 +200,7 @@ def init(
         ti_arch = TI_ARCH[platform][gs_backend.cpu]
 
     # init taichi
-    with patch("builtins.print", fake_print):
+    with redirect_stdout(_ti_outputs):
         ti.init(
             arch=ti_arch,
             # debug is causing segfault on some machines
@@ -196,6 +211,7 @@ def init(
             force_scalarize_matrix=True,
             # Turning off 'advanced_optimization' is causing issues on MacOS
             advanced_optimization=True,
+            cfg_optimization=performance_mode,
             fast_math=not debug,
             default_ip=ti_int,
             default_fp=ti_float,
@@ -218,9 +234,10 @@ def init(
         f"Running on ~~<[{device_name}]>~~ with backend ~~<{backend}>~~. Device memory: ~~<{total_mem:.2f}>~~ GB."
     )
 
-    for ti_output in _ti_outputs:
+    for ti_output in _ti_outputs.getvalue().splitlines():
         logger.debug(ti_output)
-    _ti_outputs.clear()
+    _ti_outputs.truncate(0)
+    _ti_outputs.seek(0)
 
     global exit_callbacks
     exit_callbacks = []
@@ -228,6 +245,8 @@ def init(
     logger.info(
         f"🚀 Genesis initialized. 🔖 version: ~~<{__version__}>~~, 🌱 seed: ~~<{seed}>~~, 📏 precision: '~~<{precision}>~~', 🐛 debug: ~~<{debug}>~~, 🎨 theme: '~~<{theme}>~~'."
     )
+
+    _initialized = True
 
 
 ########################## init ##########################
@@ -290,6 +309,7 @@ def _display_greeting(INFO_length):
     wave_width = max(0, min(38, wave_width))
     bar_width = wave_width * 2 + 9
     wave = ("┈┉" * wave_width)[:wave_width]
+    global logger
     logger.info(f"~<╭{'─'*(bar_width)}╮>~")
     logger.info(f"~<│{wave}>~ ~~~~<Genesis>~~~~ ~<{wave}│>~")
     logger.info(f"~<╰{'─'*(bar_width)}╯>~")
@@ -313,9 +333,10 @@ def _custom_excepthook(exctype, value, tb):
     print("".join(traceback.format_exception(exctype, value, tb)))
 
     # Logger the exception right before exit if possible
+    global logger
     try:
         logger.error(f"{exctype.__name__}: {value}")
-    except AttributeError:
+    except (AttributeError, NameError):
         # Logger may not be configured at this point
         pass
 

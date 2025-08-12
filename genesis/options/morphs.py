@@ -48,11 +48,11 @@ class Morph(Options):
     Parameters
     ----------
     pos : tuple, shape (3,), optional
-        The position of the entity in meters. Defaults to (0.0, 0.0, 0.0).
+        The initial position of the entity in meters at creation time. Defaults to (0.0, 0.0, 0.0).
     euler : tuple, shape (3,), optional
-        The euler angle of the entity in degrees. This follows scipy's extrinsic x-y-z rotation convention. Defaults to (0.0, 0.0, 0.0).
+        The initial euler angle of the entity in degrees at creation time. This follows scipy's extrinsic x-y-z rotation convention. Defaults to (0.0, 0.0, 0.0).
     quat : tuple, shape (4,), optional
-        The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
+        The initial quaternion (w-x-y-z convention) of the entity at creation time. If specified, `euler` will be ignored. Defaults to None.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision purposes. Defaults to True. `visualization` and `collision` cannot both be False. **This is only used for RigidEntity.**
     collision : bool, optional
@@ -63,6 +63,7 @@ class Morph(Options):
         Whether the entity is free to move. Defaults to True. **This is only used for RigidEntity.**
     """
 
+    # Note: pos, euler, quat store only initial varlues at creation time, and are unaffected by sim
     pos: tuple = (0.0, 0.0, 0.0)
     euler: Optional[tuple] = None
     quat: Optional[tuple] = None
@@ -813,6 +814,9 @@ class Drone(FileMorph):
     default_armature : float, optional
         Default rotor inertia of the actuators. In practice it is applied to all joints regardless of whether they are
         actuated. None to disable. Default to 0.1.
+    default_base_ang_damping_scale : float, optional
+        Default angular damping applied on the floating base that will be rescaled by the total mass.
+        None to disable. Default to 1e-5.
     """
 
     model: str = "CF2X"
@@ -824,6 +828,7 @@ class Drone(FileMorph):
     merge_fixed_links: bool = True
     links_to_keep: Sequence[str] = ()
     default_armature: Optional[float] = 0.1
+    default_base_ang_damping_scale: Optional[float] = 1e-5
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -893,6 +898,8 @@ class Terrain(Morph):
         The size of each cell in the subterrain in meters. Defaults to 0.25.
     vertical_scale : float, optional
         The height of each step in the subterrain in meters. Defaults to 0.005.
+    uv_scale : float, optional
+        The scale of the UV mapping for the terrain. Defaults to 1.0.
     subterrain_types : str or 2D list of str, optional
         The types of subterrains to generate. If a string, it will be repeated for all subterrains. If a 2D list, it should have the same shape as `n_subterrains`.
     height_field : array-like, optional
@@ -901,6 +908,8 @@ class Terrain(Morph):
         The name of the terrain to save
     from_stored : str, optional
         The path of the stored terrain to load
+    subterrain_parameters : dictionary, optional
+        Lets users pick their own subterrain parameters.
     """
 
     is_free: bool = False
@@ -909,6 +918,7 @@ class Terrain(Morph):
     subterrain_size: Tuple[float, float] = (12.0, 12.0)  # meter
     horizontal_scale: float = 0.25  # meter size of each cell in the subterrain
     vertical_scale: float = 0.005  # meter height of each step in the subterrain
+    uv_scale: float = 1.0
     subterrain_types: Any = [
         ["flat_terrain", "random_uniform_terrain", "stepping_stones_terrain"],
         ["pyramid_sloped_terrain", "discrete_obstacles_terrain", "wave_terrain"],
@@ -917,9 +927,22 @@ class Terrain(Morph):
     height_field: Any = None
     name: str = "default"  # name to store and reuse the terrain
     from_stored: Any = None
+    subterrain_parameters: dict[str, dict] | None = None
 
     def __init__(self, **data):
+        custom_params = data.get("subterrain_parameters") or {}
+        terrain_types = set(self.default_params) | set(custom_params)
+        overwritten_params = {}
+
+        for terrain_type in terrain_types:
+            default_value = self.default_params.get(terrain_type, {})
+            custom_value = custom_params.get(terrain_type, {})
+            overwritten_params[terrain_type] = default_value | custom_value
+
+        data["subterrain_parameters"] = overwritten_params
         super().__init__(**data)
+
+        self._subterrain_parameters = overwritten_params
 
         supported_subterrain_types = [
             "flat_terrain",
@@ -968,3 +991,53 @@ class Terrain(Morph):
             self.subterrain_size[1], self.horizontal_scale
         ):
             gs.raise_exception("`subterrain_size` should be divisible by `horizontal_scale`.")
+
+    @property
+    def default_params(self):
+        return {
+            "flat_terrain": {},
+            "fractal_terrain": {
+                "levels": 8,
+                "scale": 5.0,
+            },
+            "random_uniform_terrain": {
+                "min_height": -0.1,
+                "max_height": 0.1,
+                "step": 0.1,
+                "downsampled_scale": 0.5,
+            },
+            "sloped_terrain": {
+                "slope": -0.5,
+            },
+            "pyramid_sloped_terrain": {
+                "slope": -0.1,
+            },
+            "discrete_obstacles_terrain": {
+                "max_height": 0.05,
+                "min_size": 1.0,
+                "max_size": 5.0,
+                "num_rects": 20,
+            },
+            "wave_terrain": {
+                "num_waves": 2.0,
+                "amplitude": 0.1,
+            },
+            "stairs_terrain": {
+                "step_width": 0.75,
+                "step_height": -0.1,
+            },
+            "pyramid_stairs_terrain": {
+                "step_width": 0.75,
+                "step_height": -0.1,
+            },
+            "stepping_stones_terrain": {
+                "stone_size": 1.0,
+                "stone_distance": 0.25,
+                "max_height": 0.2,
+                "platform_size": 0.0,
+            },
+        }
+
+    @property
+    def subterrain_params(self):
+        return self._subterrain_parameters
