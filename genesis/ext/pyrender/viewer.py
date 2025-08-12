@@ -246,6 +246,7 @@ class Viewer(pyglet.window.Window):
             "cull_faces": True,
             "offscreen": False,
             "point_size": 1.0,
+            "rgb": True,
             "seg": False,
             "depth": False,
         }
@@ -280,10 +281,6 @@ class Viewer(pyglet.window.Window):
                 self._render_flags[key] = kwargs[key]
             elif key in self.viewer_flags:
                 self._viewer_flags[key] = kwargs[key]
-
-        # # TODO MAC OS BUG FOR SHADOWS
-        # if sys.platform == 'darwin':
-        #     self._render_flags['shadows'] = False
 
         self._registered_keys = {}
         if registered_keys is not None:
@@ -399,8 +396,6 @@ class Viewer(pyglet.window.Window):
 
         self.pending_offscreen_camera = None
         self.offscreen_result = None
-
-        self.pending_buffer_updates = {}
 
         # Starting the viewer would raise an exception if the OpenGL context is invalid for some reason. This exception
         # must be caught in order to implement some fallback mechanism. One may want to start the viewer from the main
@@ -635,11 +630,12 @@ class Viewer(pyglet.window.Window):
 
         self._offscreen_result_semaphore.release()
 
-    def render_offscreen(self, camera_node, render_target, depth=False, seg=False, normal=False):
-        if seg:
-            self.render_flags["seg"] = True
-        if depth:
-            self.render_flags["depth"] = True
+    def render_offscreen(self, camera_node, render_target, rgb=True, depth=False, seg=False, normal=False):
+        if rgb and seg:
+            gs.raise_exception("RGB and segmentation map cannot be rendered in the same forward pass.")
+        self.render_flags["rgb"] = rgb
+        self.render_flags["seg"] = seg
+        self.render_flags["depth"] = depth
         self.pending_offscreen_camera = (camera_node, render_target, normal)
         if self._run_in_thread:
             # send_offscreen_request
@@ -649,15 +645,10 @@ class Viewer(pyglet.window.Window):
         else:
             # Force offscreen rendering synchronously
             self.draw_offscreen()
-        if seg:
-            self.render_flags["seg"] = False
-        if depth:
-            self.render_flags["depth"] = False
+        self.render_flags["rgb"] = True
+        self.render_flags["seg"] = False
+        self.render_flags["depth"] = False
         return self.offscreen_result
-
-    def update_buffers(self):
-        self._renderer.jit.update_buffer(self.pending_buffer_updates)
-        self.pending_buffer_updates.clear()
 
     def wait_until_initialized(self):
         self._initialized_event.wait()
@@ -671,14 +662,17 @@ class Viewer(pyglet.window.Window):
 
         # Make OpenGL context current
         self.switch_to()
-        self.update_buffers()
+
+        # Update the context if not already done before
+        self._renderer.jit.update_buffer(self.gs_context.buffer)
+        self.gs_context.buffer.clear()
 
         self.offscreen_results = []
         self.render_flags["offscreen"] = True
         camera, target, normal = self.pending_offscreen_camera
         self.clear()
         retval = self._render(camera, target, normal)
-        self.offscreen_result = retval if retval else [None, None]
+        self.offscreen_result = retval if retval else (None, None)
         self.pending_offscreen_camera = None
         self.render_flags["offscreen"] = False
         self._offscreen_result_semaphore.release()
@@ -696,7 +690,10 @@ class Viewer(pyglet.window.Window):
 
         # Make OpenGL context current
         self.switch_to()
-        self.update_buffers()
+
+        # Update the context if not already done before
+        self._renderer.jit.update_buffer(self.gs_context.buffer)
+        self.gs_context.buffer.clear()
 
         # Render the scene
         self.clear()
@@ -751,7 +748,7 @@ class Viewer(pyglet.window.Window):
         if self._run_in_thread or not self.auto_start:
             self.render_lock.release()
 
-    def on_resize(self, width, height):
+    def on_resize(self, width: int, height: int) -> EVENT_HANDLE_STATE:
         """Resize the camera and trackball when the window is resized."""
         if self._renderer is None:
             return
@@ -763,6 +760,7 @@ class Viewer(pyglet.window.Window):
         self._trackball.resize(self._viewport_size)
         self._renderer.viewport_width = self._viewport_size[0]
         self._renderer.viewport_height = self._viewport_size[1]
+        self.viewer_interaction.on_resize(width, height)
         self.on_draw()
 
     def on_mouse_motion(self, x: int, y: int, dx: int, dy: int) -> EVENT_HANDLE_STATE:
@@ -1065,11 +1063,12 @@ class Viewer(pyglet.window.Window):
         filename = self._get_save_filename(["png", "jpg", "gif", "all"])
         if filename is not None:
             self.viewer_flags["save_directory"] = os.path.dirname(filename)
-            imageio.imwrite(filename, self._renderer.read_color_buf())
+            data = self._renderer.jit.read_color_buf(*self._viewport_size, rgba=False)
+            imageio.imwrite(filename, img_arr)
 
     def _record(self):
         """Save another frame for the GIF."""
-        data = self._renderer.read_color_buf()
+        data = self._renderer.jit.read_color_buf(*self._viewport_size, rgba=False)
         if not np.all(data == 0.0):
             self.video_recorder.write_frame(data)
 
@@ -1140,8 +1139,13 @@ class Viewer(pyglet.window.Window):
 
         if self.render_flags["depth"]:
             flags |= RenderFlags.RET_DEPTH
+            if not (self.render_flags["rgb"] or self.render_flags["seg"]):
+                flags |= RenderFlags.DEPTH_ONLY
 
-        retval = renderer.render(self.scene, flags, seg_node_map=seg_node_map)
+        if self.render_flags["rgb"] or self.render_flags["depth"] or self.render_flags["seg"]:
+            retval = renderer.render(self.scene, flags, seg_node_map=seg_node_map)
+        else:
+            retval = ()
 
         if normal:
             class CustomShaderCache:
@@ -1164,8 +1168,8 @@ class Viewer(pyglet.window.Window):
             if self.render_flags["env_separate_rigid"]:
                 flags |= RenderFlags.ENV_SEPARATE
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-            normal_arr, _ = renderer.render(scene, flags, is_first_pass=False)
-            retval = retval + (normal_arr,)
+            normal_arr, *_ = renderer.render(scene, flags, is_first_pass=False)
+            retval = (*retval, normal_arr)
 
             renderer._program_cache = old_cache
 
@@ -1287,6 +1291,9 @@ class Viewer(pyglet.window.Window):
             self.dispatch_events()
         if self._is_active:
             self.flip()
+
+    def update_on_sim_step(self):
+        self.viewer_interaction.update_on_sim_step()
 
     def _compute_initial_camera_pose(self):
         centroid = self.scene.centroid

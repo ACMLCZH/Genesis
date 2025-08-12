@@ -35,6 +35,8 @@ class RasterizerContext:
         self.rendered_envs_idx = options.rendered_envs_idx
         self.env_separate_rigid = options.env_separate_rigid
 
+        self.buffer = dict()
+
         # nodes
         self.world_frame_node = None
         self.link_frame_nodes = dict()
@@ -214,7 +216,8 @@ class RasterizerContext:
 
     def on_world_frame(self):
         if not self.world_frame_shown:
-            self.world_frame_node = self.add_node(pyrender.Mesh.from_trimesh(self.world_frame_mesh, smooth=True))
+            mesh = pyrender.Mesh.from_trimesh(self.world_frame_mesh, smooth=True, is_marker=True)
+            self.world_frame_node = self.add_node(mesh)
             self.world_frame_shown = True
 
     def off_world_frame(self):
@@ -231,13 +234,13 @@ class RasterizerContext:
                 links_quat = self.sim.rigid_solver.links_state.quat.to_numpy()
 
                 for link in links:
-                    self.link_frame_nodes[link.uid] = self.add_node(
-                        pyrender.Mesh.from_trimesh(
-                            mesh=self.link_frame_mesh,
-                            poses=gu.trans_quat_to_T(links_pos[link.idx], links_quat[link.idx]),
-                            env_shared=not self.env_separate_rigid,
-                        )
+                    mesh = pyrender.Mesh.from_trimesh(
+                        mesh=self.link_frame_mesh,
+                        poses=gu.trans_quat_to_T(links_pos[link.idx], links_quat[link.idx]),
+                        env_shared=not self.env_separate_rigid,
+                        is_marker=True,
                     )
+                    self.link_frame_nodes[link.uid] = self.add_node(mesh)
             self.link_frame_shown = True
 
     def off_link_frame(self):
@@ -486,7 +489,8 @@ class RasterizerContext:
         if self.sim.mpm_solver.is_active():
             idx = self.rendered_envs_idx[0]
             particles_all = self.sim.mpm_solver.particles_render.pos.to_numpy()[:, idx]
-            active_all = self.sim.mpm_solver.particles_render.active.to_numpy(dtype=np.bool_)[:, idx]
+            active_all = self.sim.mpm_solver.particles_render.active.to_numpy(dtype=gs.np_bool)[:, idx]
+            active_all = active_all.astype(dtype=np.bool_, copy=False)
             vverts_all = self.sim.mpm_solver.vverts_render.pos.to_numpy()[:, idx, :]
 
             for mpm_entity in self.sim.mpm_solver.entities:
@@ -551,7 +555,8 @@ class RasterizerContext:
         if self.sim.sph_solver.is_active():
             idx = self.rendered_envs_idx[0]
             particles_all = self.sim.sph_solver.particles_render.pos.to_numpy()[:, idx]
-            active_all = self.sim.sph_solver.particles_render.active.to_numpy(dtype=np.bool_)[:, idx]
+            active_all = self.sim.sph_solver.particles_render.active.to_numpy(dtype=gs.np_bool)[:, idx]
+            active_all = active_all.astype(dtype=np.bool_, copy=False)
 
             for sph_entity in self.sim.sph_solver.entities:
                 if sph_entity.surface.vis_mode == "recon":
@@ -627,7 +632,8 @@ class RasterizerContext:
             idx = self.rendered_envs_idx[0]
             particles_all = self.sim.pbd_solver.particles_render.pos.to_numpy()[:, idx]
             particles_vel_all = self.sim.pbd_solver.particles_render.vel.to_numpy()[:, idx]
-            active_all = self.sim.pbd_solver.particles_render.active.to_numpy(dtype=np.bool_)[:, idx]
+            active_all = self.sim.pbd_solver.particles_render.active.to_numpy(dtype=gs.np_bool)[:, idx]
+            active_all = active_all.astype(dtype=np.bool_, copy=False)
             vverts_all = self.sim.pbd_solver.vverts_render.pos.to_numpy()[:, idx]
 
             for pbd_entity in self.sim.pbd_solver.entities:
@@ -721,8 +727,10 @@ class RasterizerContext:
             self.add_light(light)
 
     def draw_debug_line(self, start, end, radius=0.002, color=(1.0, 0.0, 0.0, 1.0)):
-        mesh = mu.create_line(start, end, radius, color)
-        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_line_{gs.UID()}")
+        mesh = mu.create_line(
+            tensor_to_array(start, dtype=np.float32), tensor_to_array(end, dtype=np.float32), radius, color
+        )
+        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_line_{gs.UID()}", is_marker=True)
         self.add_external_node(node)
         return node
 
@@ -736,7 +744,7 @@ class RasterizerContext:
             pose[0, :3, 3] = tensor_to_array(pos)
             gu.z_up_to_R(tensor_to_array(vec).astype(np.float32), out=pose[0, :3, :3])
 
-            node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_arrow_{gs.UID()}", poses=pose)
+            node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_arrow_{gs.UID()}", poses=pose, is_marker=True)
             if persistent:
                 self.add_external_node(node)
             else:
@@ -744,34 +752,21 @@ class RasterizerContext:
             return node
 
     def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01):
-        node = pyrender.Mesh.from_trimesh(
-            trimesh.creation.axis(
-                origin_size=origin_size,
-                axis_radius=axis_radius,
-                axis_length=axis_length,
-            ),
-            name=f"debug_frame_{gs.UID()}",
-        )
+        mesh = trimesh.creation.axis(origin_size=origin_size, axis_radius=axis_radius, axis_length=axis_length)
+        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_frame_{gs.UID()}", is_marker=True)
         self.add_external_node(node, pose=T)
         return node
 
     def draw_debug_frames(self, poses, axis_length=1.0, origin_size=0.015, axis_radius=0.01):
-        node = pyrender.Mesh.from_trimesh(
-            trimesh.creation.axis(
-                origin_size=origin_size,
-                axis_radius=axis_radius,
-                axis_length=axis_length,
-            ),
-            name=f"debug_frame_{gs.UID()}",
-            poses=poses,
-        )
+        mesh = trimesh.creation.axis(origin_size=origin_size, axis_radius=axis_radius, axis_length=axis_length)
+        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_frame_{gs.UID()}", poses=poses, is_marker=True)
         self.add_external_node(node)
         return node
 
     def draw_debug_mesh(self, mesh, pos=np.zeros(3), T=None):
         if T is None:
             T = gu.trans_to_T(tensor_to_array(pos))
-        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_mesh_{gs.UID()}")
+        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_mesh_{gs.UID()}", is_marker=True)
         self.add_external_node(node, pose=T)
         return node
 
@@ -783,7 +778,9 @@ class RasterizerContext:
     def draw_debug_sphere(self, pos, radius=0.01, color=(1.0, 0.0, 0.0, 0.5), persistent=True):
         mesh = mu.create_sphere(radius=radius, color=color)
         pose = gu.trans_to_T(tensor_to_array(pos))
-        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_sphere_{gs.UID()}", smooth=True, poses=pose[None])
+        node = pyrender.Mesh.from_trimesh(
+            mesh, name=f"debug_sphere_{gs.UID()}", smooth=True, poses=pose[None], is_marker=True
+        )
         if persistent:
             self.add_external_node(node)
         else:
@@ -793,7 +790,9 @@ class RasterizerContext:
     def draw_debug_spheres(self, poss, radius=0.01, color=(1.0, 0.0, 0.0, 0.5), persistent=True):
         mesh = mu.create_sphere(radius=radius, color=color)
         poses = gu.trans_to_T(tensor_to_array(poss))
-        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_spheres_{gs.UID()}", smooth=True, poses=poses)
+        node = pyrender.Mesh.from_trimesh(
+            mesh, name=f"debug_spheres_{gs.UID()}", smooth=True, poses=poses, is_marker=True
+        )
         if persistent:
             self.add_external_node(node)
         else:
@@ -808,7 +807,7 @@ class RasterizerContext:
             wireframe_radius=wireframe_radius,
             color=color,
         )
-        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_box_{gs.UID()}")
+        node = pyrender.Mesh.from_trimesh(mesh, name=f"debug_box_{gs.UID()}", is_marker=True)
         self.add_external_node(node)
         return node
 
@@ -820,7 +819,7 @@ class RasterizerContext:
         elif len(colors.shape) == 2:
             assert colors.shape[0] == len(poss)
 
-        node = pyrender.Mesh.from_points(poss, name=f"debug_box_{gs.UID()}", colors=colors)
+        node = pyrender.Mesh.from_points(poss, name=f"debug_box_{gs.UID()}", colors=colors, is_marker=True)
         self.add_external_node(node)
         return node
 
@@ -831,12 +830,11 @@ class RasterizerContext:
         self.clear_external_nodes()
 
     def update(self):
-        buffer_updates = dict()
+        # Early return if already updated previously
+        if self._t >= self.scene._t:
+            return
 
-        if self._t >= self.scene._t:  # already updated
-            return buffer_updates
-        else:
-            self._t = self.scene._t
+        self._t = self.scene._t
 
         # clear up all dynamic nodes
         self.clear_dynamic_nodes()
@@ -844,18 +842,19 @@ class RasterizerContext:
         # update variables not used in simulation
         self.visualizer.update_visual_states()
 
+        # Reset scene bounds to trigger recomputation. They are involved in shadow map
         self._scene._bounds = None
-        self.update_link_frame(buffer_updates)
-        self.update_tool(buffer_updates)
-        self.update_rigid(buffer_updates)
-        self.update_contact(buffer_updates)
-        self.update_avatar(buffer_updates)
-        self.update_mpm(buffer_updates)
-        self.update_sph(buffer_updates)
-        self.update_pbd(buffer_updates)
-        self.update_fem(buffer_updates)
 
-        return buffer_updates
+        self.buffer.clear()
+        self.update_link_frame(self.buffer)
+        self.update_tool(self.buffer)
+        self.update_rigid(self.buffer)
+        self.update_contact(self.buffer)
+        self.update_avatar(self.buffer)
+        self.update_mpm(self.buffer)
+        self.update_sph(self.buffer)
+        self.update_pbd(self.buffer)
+        self.update_fem(self.buffer)
 
     def add_light(self, light):
         # light direction is light pose's -z frame
@@ -875,7 +874,7 @@ class RasterizerContext:
             self.seg_node_map[seg_node] = self.seg_idxc_to_idxc_rgb(seg_idxc)
 
     def remove_node_seg(self, seg_node):
-        self.seg_node_map.pop(seg_node)
+        self.seg_node_map.pop(seg_node, None)
 
     def generate_seg_vars(self):
         # seg_key: same as entity/link/geom's idx

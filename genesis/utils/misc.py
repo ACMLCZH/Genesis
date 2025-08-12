@@ -6,12 +6,11 @@ import platform
 import random
 import types
 import shutil
-import subprocess
 import sys
 import os
 from dataclasses import dataclass
 from collections import OrderedDict
-from typing import Any, Type
+from typing import Any, Type, NoReturn
 
 import numpy as np
 import cpuinfo
@@ -36,11 +35,11 @@ class DeprecationError(Exception):
     pass
 
 
-def raise_exception(msg="Something went wrong."):
+def raise_exception(msg="Something went wrong.") -> NoReturn:
     raise gs.GenesisException(msg)
 
 
-def raise_exception_from(msg="Something went wrong.", cause=None):
+def raise_exception_from(msg="Something went wrong.", cause=None) -> NoReturn:
     raise gs.GenesisException(msg) from cause
 
 
@@ -206,9 +205,8 @@ def get_device(backend: gs_backend):
             total_mem = device_property.total_memory / 1024**3
         else:  # pytorch tensors on cpu
             # logger may not be configured at this point
-            getattr(gs, "logger", LOGGER).warning(
-                "No Intel XPU device available. Falling back to CPU for torch device."
-            )
+            logger = getattr(gs, "logger", None) or LOGGER
+            logger.warning("No Intel XPU device available. Falling back to CPU for torch device.")
             device, device_name, total_mem, _ = get_device(gs_backend.cpu)
 
     elif backend == gs_backend.gpu:
@@ -272,6 +270,14 @@ def get_remesh_cache_dir():
     return os.path.join(get_cache_dir(), "rm")
 
 
+def get_exr_cache_dir():
+    return os.path.join(get_cache_dir(), "exr")
+
+
+def get_usd_cache_dir():
+    return os.path.join(get_cache_dir(), "usd")
+
+
 def clean_cache_files():
     folder = gs.utils.misc.get_cache_dir()
     try:
@@ -332,7 +338,10 @@ MAX_CACHE_SIZE = 1000
 class FieldMetadata:
     ndim: int
     shape: tuple[int, ...]
-    dtype: ti._lib.core.DataType
+    try:
+        dtype: ti._lib.core.DataType
+    except:
+        dtype: ti._lib.core.DataTypeCxx
     mapping_key: Any
 
 
@@ -467,7 +476,7 @@ def ti_field_to_torch(
             if mask is None or isinstance(mask, slice):
                 # Slices are always valid by default. Nothing to check.
                 is_out_of_bounds = False
-            elif isinstance(mask, int):
+            elif isinstance(mask, (int, np.integer)):
                 # Do not allow negative indexing for consistency with Taichi
                 is_out_of_bounds = not (0 <= mask < _field_shape[i])
             elif isinstance(mask, torch.Tensor):
@@ -487,12 +496,12 @@ def ti_field_to_torch(
     # Must convert masks to torch if not slice or int since torch will do it anyway.
     # Note that being contiguous is not required and does not affect performance.
     must_allocate = False
-    is_row_mask_tensor = not (row_mask is None or isinstance(row_mask, (slice, int)))
+    is_row_mask_tensor = not (row_mask is None or isinstance(row_mask, (slice, int, np.integer)))
     if is_row_mask_tensor:
         _row_mask = torch.as_tensor(row_mask, dtype=gs.tc_int, device=gs.device)
         must_allocate = _row_mask is not row_mask
         row_mask = _row_mask
-    is_col_mask_tensor = not (col_mask is None or isinstance(col_mask, (slice, int)))
+    is_col_mask_tensor = not (col_mask is None or isinstance(col_mask, (slice, int, np.integer)))
     if is_col_mask_tensor:
         _col_mask = torch.as_tensor(col_mask, dtype=gs.tc_int, device=gs.device)
         must_allocate = _col_mask is not col_mask
@@ -532,8 +541,8 @@ def ti_field_to_torch(
     # Extract slice if necessary.
     # Note that unsqueeze is MUCH faster than indexing with `[row_mask]` to keep batch dimensions,
     # because this required allocating GPU data.
-    is_single_col = (is_col_mask_tensor and col_mask.ndim == 0) or isinstance(col_mask, int)
-    is_single_row = (is_row_mask_tensor and row_mask.ndim == 0) or isinstance(row_mask, int)
+    is_single_col = (is_col_mask_tensor and col_mask.ndim == 0) or isinstance(col_mask, (int, np.integer))
+    is_single_row = (is_row_mask_tensor and row_mask.ndim == 0) or isinstance(row_mask, (int, np.integer))
     try:
         if is_col_mask_tensor and is_row_mask_tensor:
             if not is_single_col and not is_single_row:
