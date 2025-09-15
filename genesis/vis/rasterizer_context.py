@@ -680,6 +680,34 @@ class RasterizerContext:
                     if normal_data is not None:
                         buffer_updates[self._scene.get_buffer_id(node, "normal")] = normal_data
 
+    def on_rod(self):
+        if self.sim.rod_solver.is_active():
+            for rod_entity in self.sim.rod_solver.entities:
+                if rod_entity.surface.vis_mode == "recon":
+                    self.add_dynamic_node(rod_entity, None)
+
+    def update_rod(self, buffer_updates):
+        if self.sim.rod_solver.is_active():
+            idx = self.rendered_envs_idx[0]
+            verts_all = self.sim.rod_solver.vertices.vert.to_numpy()[0, :, idx]
+            radii_all = self.sim.rod_solver.vertices_info.radius.to_numpy()
+
+            for rod_entity in self.sim.rod_solver.entities:
+                rod_idx = rod_entity._rod_idx
+                if rod_entity.surface.vis_mode == "recon":
+                    first_vert_idx = self.sim.rod_solver.rods_info[rod_idx].first_vert_idx
+                    n_verts = self.sim.rod_solver.rods_info[rod_idx].n_verts
+                    is_loop = self.sim.rod_solver.rods_info[rod_idx].is_loop
+                    mesh = ru.mesh_from_centerline(
+                        verts = verts_all[first_vert_idx : first_vert_idx + n_verts],
+                        radii = radii_all[first_vert_idx : first_vert_idx + n_verts],
+                        endcaps=True,
+                        is_loop=is_loop,
+                        smooth_joints=True,
+                    )
+                    mesh.visual = mu.surface_uvs_to_trimesh_visual(rod_entity.surface, uvs=mesh.visual.uv, n_verts=len(mesh.vertices))
+                    self.add_dynamic_node(rod_entity, pyrender.Mesh.from_trimesh(mesh, smooth=False))
+
     def on_fem(self):
         if self.sim.fem_solver.is_active():
             vertices_all, triangles_all = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
